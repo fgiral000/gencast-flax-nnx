@@ -1,191 +1,190 @@
-# Copyright 2024 DeepMind Technologies Limited.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#      http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS-IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-"""DPM-Solver++ 2S sampler from https://arxiv.org/abs/2211.01095."""
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+DPM-Solver++ 2S sampler for GenSynth CFD diffusion.
 
-from typing import Optional
+Threads an explicit PRNGKey pulled from nnx.Rngs through lax.fori_loop,
+executes purely on raw JAX arrays. Now works with JAX arrays instead of xarray.
+"""
 
-from graphcast import casting
-from gencast import denoisers_base
-from gencast import samplers_base as base
-from gencast import samplers_utils as utils
-from common import xarray_jax
 import flax.nnx as nnx
 import jax
 import jax.numpy as jnp
-import xarray
+from typing import Optional, Tuple, Dict
+from graphcast import casting
+from gencast import samplers_utils as utils
 
 
-class Sampler(nnx.Module, base.Sampler):
-  """Sampling using DPM-Solver++ 2S from [1].
+class Sampler:
+    def __init__(
+        self,
+        denoiser: nnx.Module,
+        max_noise_level: float,
+        min_noise_level: float,
+        num_noise_levels: int,
+        rho: float,
+        stochastic_churn_rate: float,
+        churn_min_noise_level: float,
+        churn_max_noise_level: float,
+        noise_level_inflation_factor: float,
+    ):
+        self._noise_levels = utils.edm_noise_schedule(
+            max_noise_level, min_noise_level, num_noise_levels, rho
+        )
+        self._stochastic_churn = stochastic_churn_rate > 0.0
+        self._per_step_churn_rates = utils.stochastic_churn_rate_schedule(
+            self._noise_levels,
+            stochastic_churn_rate,
+            churn_min_noise_level,
+            churn_max_noise_level,
+        )
+        self._noise_level_inflation_factor = noise_level_inflation_factor
+        self._denoiser = denoiser
+        self.sigma_data = 1.0
 
-  This is combined with optional stochastic churn as described in [2].
+    def __call__(
+        self,
+        noisy_inputs: jnp.ndarray,
+        forcings: Dict[str, jnp.ndarray],
+        rngs: nnx.Rngs = None,
+    ) -> jnp.ndarray:
+        """
+        Args:
+            noisy_inputs: Shape (batch, node, channels)
+            forcings: Dict with keys like 'case_number', 'U_mag_prev'
+            rngs: Random number generator state
+        
+        Returns:
+            Denoised output with same shape as noisy_inputs
+        """
+        if rngs is None:
+            raise ValueError("Must pass rngs: nnx.Rngs(...) to Sampler")
+        key = rngs.noise()  # pull once, outside any JAX trace
 
-  The '2S' terminology from [1] means that this is a second-order (2),
-  single-step (S) solver. Here 'single-step' here distinguishes it from
-  'multi-step' methods where the results of function evaluations from previous
-  steps are reused in computing updates for subsequent steps. The solver still
-  uses multiple steps though.
+        # Get array template and dtype
+        arr_tmpl = noisy_inputs
+        dtype = arr_tmpl.dtype
 
-  [1] DPM-Solver++: Fast Solver for Guided Sampling of Diffusion Probabilistic
-  Models, https://arxiv.org/abs/2211.01095
-  [2] Elucidating the Design Space of Diffusion-Based Generative Models,
-  https://arxiv.org/abs/2206.00364
-  """
+        # 2) schedules
+        sigmas = jnp.array(self._noise_levels, dtype=dtype)
+        churns = jnp.array(self._per_step_churn_rates, dtype=dtype)
 
-  def __init__(self,
-               denoiser: nnx.Module,
-               max_noise_level: float,
-               min_noise_level: float,
-               num_noise_levels: int,
-               rho: float,
-               stochastic_churn_rate: float,
-               churn_min_noise_level: float,
-               churn_max_noise_level: float,
-               noise_level_inflation_factor: float,
-               rngs: nnx.Rngs,
-               ):
-    """Initializes the sampler.
+        # 3) denoiser wrapper on raw arrays
+        def denoise_arr(sigma: jnp.ndarray, x_arr: jnp.ndarray) -> jnp.ndarray:
+            # Handle the edge case where sigma=0 which causes NaNs in the denoiser
+            eps = 1e-6  # small epsilon to avoid sigma=0
+            sigma_safe = jnp.maximum(sigma, eps)
+            
+            # Build noise_levels as a (batch,) array
+            batch_size = x_arr.shape[0]
+            sigma_arr = jnp.full((batch_size,), sigma_safe, dtype=sigma_safe.dtype)
+            
+            return self._preconditioned_denoiser(
+                noisy_inputs=x_arr,
+                noise_levels=sigma_arr,
+                forcings=forcings
+            )
+            
+            # # Cast back to original dtype to maintain consistency
+            # return result.astype(x_arr.dtype)
 
-    Args:
-      denoiser: A Denoiser which predicts noise-free targets.
-      max_noise_level: The highest noise level used at the start of the
-        sequence of reverse diffusion steps.
-      min_noise_level: The lowest noise level used at the end of the sequence of
-        reverse diffusion steps.
-      num_noise_levels: Determines the number of noise levels used and hence the
-        number of reverse diffusion steps performed.
-      rho: Parameter affecting the spacing of noise steps. Higher values will
-        concentrate noise steps more around zero.
-      stochastic_churn_rate: S_churn from the paper. This controls the rate
-        at which noise is re-injected/'churned' during the sampling algorithm.
-        If this is set to zero then we are performing deterministic sampling
-        as described in Algorithm 1.
-      churn_min_noise_level: Minimum noise level at which stochastic churn
-        occurs. S_min from the paper. Only used if stochastic_churn_rate > 0.
-      churn_max_noise_level: Maximum noise level at which stochastic churn
-        occurs. S_min from the paper. Only used if stochastic_churn_rate > 0.
-      noise_level_inflation_factor: This can be used to set the actual amount of
-        noise injected higher than what the denoiser is told has been added.
-        The motivation is to compensate for a tendency of L2-trained denoisers
-        to remove slightly too much noise / blur too much. S_noise from the
-        paper. Only used if stochastic_churn_rate > 0.
-    """
-    self._noise_levels = utils.noise_schedule(
-        max_noise_level, min_noise_level, num_noise_levels, rho)
-    self._stochastic_churn = stochastic_churn_rate > 0
-    self._per_step_churn_rates = utils.stochastic_churn_rate_schedule(
-        self._noise_levels, stochastic_churn_rate, churn_min_noise_level,
-        churn_max_noise_level)
-    self._noise_level_inflation_factor = noise_level_inflation_factor
-    self._denoiser = denoiser
-    self._rgns = rngs
+        def body_fn(i: jnp.ndarray,
+                    state: Tuple[jnp.ndarray, jnp.ndarray]
+                ) -> Tuple[jnp.ndarray, jnp.ndarray]:
+            """
+            One iteration of the 2S sampler, mirroring the DeepMind implementation
+            but on raw JAX arrays plus RNG key.
+            """
+            x_arr, key = state
+            # ——————————————————————————————————————————————————————————————
+            # 1) Initial noise injection at i == 0
+            # ——————————————————————————————————————————————————————————————
+            # sample i.i.d. normal noise
+            init_noise, key = utils.spherical_white_noise_like(x_arr, key)
+            # only apply on the very first step
+            is_first = (i == 0).astype(dtype)
+            x_arr = x_arr + init_noise * sigmas[0] * is_first
 
-  def __call__(
-      self,
-      inputs: xarray.Dataset,
-      targets_template: xarray.Dataset,
-      forcings: Optional[xarray.Dataset] = None,
-      **kwargs) -> xarray.Dataset:
+            # ——————————————————————————————————————————————————————————————
+            # 2) Current noise level
+            # ——————————————————————————————————————————————————————————————
+            sigma = sigmas[i]
 
-    dtype = casting.infer_floating_dtype(targets_template)  # pytype: disable=wrong-arg-types
-    noise_levels = jnp.array(self._noise_levels).astype(dtype)
-    per_step_churn_rates = jnp.array(self._per_step_churn_rates).astype(dtype)
+            # ——————————————————————————————————————————————————————————————
+            # 3) Stochastic churn (if enabled)
+            # ——————————————————————————————————————————————————————————————
+            if self._stochastic_churn:
+                x_arr, sigma, key = utils.apply_stochastic_churn(
+                    x_arr,
+                    sigma,
+                    churns[i],
+                    self._noise_level_inflation_factor,
+                    key
+                )
 
-    def denoiser(noise_level: jnp.ndarray, x: xarray.Dataset) -> xarray.Dataset:
-      """Computes D(x, sigma, y)."""
-      bcast_noise_level = xarray_jax.DataArray(
-          jnp.tile(noise_level, x.sizes['batch']), dims=('batch',))
-      # Estimate the expectation of the fully-denoised target x0, conditional on
-      # inputs/forcings, noisy targets and their noise level:
-      return self._denoiser(
-          inputs=inputs,
-          noisy_targets=x,
-          noise_levels=bcast_noise_level,
-          forcings=forcings)
+            # ——————————————————————————————————————————————————————————————
+            # 4) ODE‐solver (2S) update
+            # ——————————————————————————————————————————————————————————————
+            # compute next and midpoint noise levels
+            sigma_next = sigmas[i + 1]
+            sigma_mid  = jnp.sqrt(sigma * sigma_next)
 
-    def body_fn(i: jnp.ndarray, x: xarray.Dataset) -> xarray.Dataset:
-      """One iteration of the sampling algorithm.
+            # first denoise at σᵢ
+            x_denoised = denoise_arr(sigma, x_arr)
 
-      Args:
-        i: Sampling iteration.
-        x: Noisy targets at iteration i, these will have noise level
-          self._noise_levels[i].
+            # midpoint update: x_mid = (σ_mid/σ) * x + (1 − σ_mid/σ) * x_denoised
+            alpha_mid = sigma_mid / sigma
+            x_mid = alpha_mid * x_arr + (1 - alpha_mid) * x_denoised
 
-      Returns:
-        Noisy targets at the next lowest noise level self._noise_levels[i+1].
-      """
-      def init_noise(template):
-        return noise_levels[0] * utils.spherical_white_noise_like(template, rngs=self._rgns)
+            # second denoise at σ_mid
+            x_mid_denoised = denoise_arr(sigma_mid, x_mid)
 
-      # Initialise the inputs if i == 0.
-      # This is done here to ensure both noise sampler calls can use the same
-      # spherical harmonic basis functions. While there may be a small compute
-      # cost the memory savings can be significant.
-      # TODO(dominicmasters): Figure out if we can merge the two noise sampler
-      # calls into one to avoid this hack.
-      maybe_init_noise = (i == 0).astype(noise_levels[0].dtype)
-      x = x + init_noise(x) * maybe_init_noise
+            # full step update: x_next = (σₙₑₓₜ/σ) * x + (1 − σₙₑₓₜ/σ) * x_mid_denoised
+            alpha_next = sigma_next / sigma
+            x_next = alpha_next * x_arr + (1 - alpha_next) * x_mid_denoised
 
-      noise_level = noise_levels[i]
+            # ——————————————————————————————————————————————————————————————
+            # 5) Final‐step correction (avoid a second denoiser call at σ=0)
+            # ——————————————————————————————————————————————————————————————
+            x_out = jnp.where(sigma_next == 0, x_denoised, x_next)
 
-      if self._stochastic_churn:
-        # We increase the noise level of x a bit before taking it down again:
-        x, noise_level = utils.apply_stochastic_churn(
-            x, noise_level,
-            stochastic_churn_rate=per_step_churn_rates[i],
-            noise_level_inflation_factor=self._noise_level_inflation_factor,
-            rngs=self._rgns,)
+            return x_out, key
 
-      # Apply one step of the ODE solver to take x down to the next lowest
-      # noise level.
 
-      # Note that the Elucidating paper's choice of sigma(t)=t and s(t)=1
-      # (corresponding to alpha(t)=1 in the DPM paper) as well as the standard
-      # choice of r=1/2 (corresponding to a geometric mean for the s_i
-      # midpoints) greatly simplifies the update from the DPM-Solver++ paper.
-      # You need to do a bit of algebraic fiddling to arrive at the below after
-      # substituting these choices into DPMSolver++'s Algorithm 1. The simpler
-      # update we arrive at helps with intuition too.
+        init = (jnp.zeros_like(arr_tmpl), key)
+        final_arr, _ = jax.lax.fori_loop(0, len(sigmas) - 1, body_fn, init)
 
-      next_noise_level = noise_levels[i + 1]
-      # This is s_{i+1} from the paper. They don't explain how the s_i are
-      # chosen, but the default choice seems to be a geometric mean, which is
-      # equivalent to setting all the r_i = 1/2.
-      mid_noise_level = jnp.sqrt(noise_level * next_noise_level)
+        # Return the final JAX array directly
+        return final_arr
+    
 
-      mid_over_current = mid_noise_level / noise_level
-      x_denoised = denoiser(noise_level, x)
-      # This turns out to be a convex combination of current and denoised x,
-      # which isn't entirely apparent from the paper formulae:
-      x_mid = mid_over_current * x + (1 - mid_over_current) * x_denoised
+    # preconditioning helpers
+    def _c_in(self, sigma: jnp.ndarray) -> jnp.ndarray:
+        return (sigma**2 + self.sigma_data**2) ** -0.5
 
-      next_over_current = next_noise_level / noise_level
-      x_mid_denoised = denoiser(mid_noise_level, x_mid)  # pytype: disable=wrong-arg-types
-      x_next = next_over_current * x + (1 - next_over_current) * x_mid_denoised
+    def _c_out(self, sigma: jnp.ndarray) -> jnp.ndarray:
+        return (sigma*self.sigma_data) / ((sigma**2 + self.sigma_data**2) ** 0.5)
 
-      # For the final step to noise level 0, we do an Euler update which
-      # corresponds to just returning the denoiser's prediction directly.
-      #
-      # In fact the behaviour above when next_noise_level == 0 is almost
-      # equivalent, except that it runs the denoiser a second time to denoise
-      # from noise level 0. The denoiser should just be the identity function in
-      # this case, but it hasn't necessarily been trained at noise level 0 so
-      # we avoid relying on this.
-      return utils.tree_where(next_noise_level == 0, x_denoised, x_next)
+    def _c_skip(self, sigma: jnp.ndarray) -> jnp.ndarray:
+        return (self.sigma_data**2) / (sigma**2 + self.sigma_data**2)
 
-    # Init with zeros but apply additional noise at step 0 to initialise the
-    # state.
-    noise_init = xarray.zeros_like(targets_template)
-    return jax.lax.fori_loop(
-        0, len(noise_levels) - 1, body_fun=body_fn, init_val=noise_init)
+    def _preconditioned_denoiser(
+        self,
+        noisy_inputs: jnp.ndarray,
+        noise_levels: jnp.ndarray,
+        forcings: Dict[str, jnp.ndarray],
+    ) -> jnp.ndarray:
+        """Apply preconditioning to the denoiser input and output."""
+        c_in = self._c_in(noise_levels)
+        # Expand dimensions for broadcasting (batch,) -> (batch, 1, ..., 1)
+        c_in_expanded = c_in.reshape((-1,) + (1,) * (noisy_inputs.ndim - 1))
+        
+        y = noisy_inputs * c_in_expanded
+        raw = self._denoiser(noisy_inputs=y, noise_levels=noise_levels, forcings=forcings)
+        
+        c_out = self._c_out(noise_levels)
+        c_skip = self._c_skip(noise_levels)
+        c_out_expanded = c_out.reshape((-1,) + (1,) * (noisy_inputs.ndim - 1))
+        c_skip_expanded = c_skip.reshape((-1,) + (1,) * (noisy_inputs.ndim - 1))
+        
+        return raw * c_out_expanded + noisy_inputs * c_skip_expanded

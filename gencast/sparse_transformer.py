@@ -1,26 +1,16 @@
-# Copyright 2024 DeepMind Technologies Limited.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#      http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS-IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-"""Transformer with either dense or sparse attention.
+"""
+Transformer with either dense or sparse attention.
 
-The sparse attention implemented here is for nodes to attend only to themselves
-and their neighbours on the graph). It assumes that the adjacency matrix has a
-banded structure, and is implemented with dense operations computing with only
-the diagonal, super diagonal, and subdiagonal blocks of the tri-block-diagonal
-attention matrix.
+To enable multi-GPU sharding, create a mesh at the top level and pass it to all modules:
 
-The basic model structure of the transformer and some functions were adapted
-from xlm's transformer_simple.py.
+import jax
+from jax.sharding import Mesh, PartitionSpec as P, NamedSharding
+from jax.experimental import mesh_utils
+
+# Example mesh creation for 4-way data and 2-way model parallelism:
+mesh = Mesh(mesh_utils.create_device_mesh((4, 2)), ('batch', 'model'))
+
+# Pass mesh=mesh to all model/module constructors.
 """
 
 import dataclasses
@@ -33,6 +23,7 @@ from gencast import sparse_transformer_utils as utils
 import flax.nnx as nnx
 import jax
 from jax.experimental.pallas.ops.tpu import splash_attention
+from jax.sharding import NamedSharding, PartitionSpec as P
 import jax.numpy as jnp
 import numpy as np
 import scipy as sp
@@ -149,7 +140,7 @@ def _make_splash_mha(
   """Construct attention kernel."""
   if mask_type == 'full':
     mask = np.broadcast_to(mask[None],
-                           (num_heads, *mask.shape)).astype(np.bool_)
+                           (num_heads, *mask.shape)).astype(bool)
 
   block_sizes = splash_attention.BlockSizes(
       block_q=block_q,
@@ -174,6 +165,10 @@ def mask_block_diags(mask: sp.sparse.csr_matrix,
                      block_size: int) -> jnp.ndarray:
   """Pad and reshape mask diag, super-siag and sub-diag blocks."""
   # add zero padding to mask
+  print("[mask_block_diags] shape =", mask.shape,
+        "block_size =", block_size,
+        "padding =", num_padding_nodes,
+        "nnz =", mask.nnz, flush=True)
   mask_padding_rows = sp.sparse.csr_matrix(
       (num_padding_nodes, mask.shape[1]), dtype=jnp.int32)
   mask = sp.sparse.vstack([mask, mask_padding_rows])
@@ -210,10 +205,10 @@ def mask_block_diags(mask: sp.sparse.csr_matrix,
 def _pad_mask(mask, num_padding_nodes: Tuple[int, int]) -> jnp.ndarray:
   q_padding, kv_padding = num_padding_nodes
   mask_padding_rows = sp.sparse.csr_matrix(
-      (q_padding, mask.shape[1]), dtype=np.bool_)
+      (q_padding, mask.shape[1]), dtype=bool)
   mask = sp.sparse.vstack([mask, mask_padding_rows])
   mask_padding_cols = sp.sparse.csr_matrix(
-      (mask.shape[0], kv_padding), dtype=np.bool_)
+      (mask.shape[0], kv_padding), dtype=bool)
   mask = sp.sparse.hstack([mask, mask_padding_cols])
   return mask
 
@@ -257,17 +252,17 @@ class WeatherMeshMask(splash_attention.splash_attention_mask.Mask):
 class FeedForward(nnx.Module):
   """Feed-forward block."""
   
-  def __init__(self, cfg: _ModelConfig, rngs: nnx.Rngs):
-    ffw_winit = nnx.initializers.variance_scaling(cfg.ffw_winit_mult / cfg.num_layers, 
-                                                  'fan_in', 'truncated_normal')
-    ffw_winit_final = nnx.initializers.variance_scaling(cfg.ffw_winit_final_mult / cfg.num_layers, 
-                                                  'fan_in', 'truncated_normal')
+  def __init__(self, cfg: _ModelConfig, rngs: nnx.Rngs, mesh):
+    ffw_winit = nnx.initializers.variance_scaling(cfg.ffw_winit_mult / cfg.num_layers, 'fan_in', 'truncated_normal')
+    ffw_winit_final = nnx.initializers.variance_scaling(cfg.ffw_winit_final_mult / cfg.num_layers, 'fan_in', 'truncated_normal')
+    kernel_init1 = nnx.with_partitioning(ffw_winit, P(None, 'model'))
+    bias_init1 = nnx.with_partitioning(nnx.initializers.zeros_init(), P('model'))
+    kernel_init2 = nnx.with_partitioning(ffw_winit_final, P(None, 'model'))
+    bias_init2 = nnx.with_partitioning(nnx.initializers.zeros_init(), P('model'))
     self.mlp = nnx.Sequential(
-      nnx.Linear(in_features=cfg.d_model, out_features=cfg.ffw_hidden, 
-                 kernel_init=ffw_winit, rngs=rngs),
-      getattr(nnx, cfg.activation),
-      nnx.Linear(in_features=cfg.ffw_hidden, out_features=cfg.d_model,
-                 kernel_init=ffw_winit_final, rngs=rngs),
+      nnx.Linear(in_features=cfg.d_model, out_features=cfg.ffw_hidden, kernel_init=kernel_init1, bias_init=bias_init1, rngs=rngs),
+      getattr(jax.nn, cfg.activation),
+      nnx.Linear(in_features=cfg.ffw_hidden, out_features=cfg.d_model, kernel_init=kernel_init2, bias_init=bias_init2, rngs=rngs),
     )
   def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
     return self.mlp(x)
@@ -275,14 +270,14 @@ class FeedForward(nnx.Module):
 
 class MultiheadLinear(nnx.Module):
   """Linearly project `x` to have `head_size` dimensions per head."""
-  def __init__(self, qkv: str, cfg: _ModelConfig, *, rngs: nnx.Rngs):
+  def __init__(self, qkv: str, cfg: _ModelConfig, *, rngs: nnx.Rngs, mesh):
     head_size = cfg.value_size if qkv == 'v' else cfg.key_size
-    attn_winit = nnx.initializers.variance_scaling(cfg.attn_winit_mult / cfg.num_layers, 
-                                                  'fan_in', 'truncated_normal')
+    attn_winit = nnx.initializers.variance_scaling(cfg.attn_winit_mult / cfg.num_layers, 'fan_in', 'truncated_normal')
+    kernel_init = nnx.with_partitioning(attn_winit, P(None, 'model'))
     self.linear = nnx.Linear(
-        cfg.d_model, # Input features
+        cfg.d_model,
         cfg.num_heads * head_size,
-        kernel_init=attn_winit,
+        kernel_init=kernel_init,
         use_bias=False,
         rngs=rngs,
     )
@@ -298,19 +293,18 @@ class MultiheadLinear(nnx.Module):
 
 class TriblockdiagMHA(nnx.Module):
   """Triblockdiag multihead attention."""
-  def __init__(self, cfg: _ModelConfig, *, rngs: nnx.Rngs):
-    self.q_proj = MultiheadLinear('q', cfg, rngs=rngs)
-    self.k_proj = MultiheadLinear('k', cfg, rngs=rngs)
-    self.v_proj = MultiheadLinear('v', cfg, rngs=rngs)
-
-    attn_winit_final = nnx.initializers.variance_scaling(self._cfg.attn_winit_final_mult / self._cfg.num_layers, 
-                                                        'fan_in', 'truncated_normal')
-    self.final_linear = nnx.Linear(in_features=self._cfg.num_heads * self._cfg.value_size, 
-                                   out_features=self._cfg.d_model, 
-                                   kernel_init=attn_winit_final, 
-                                   rngs=self.rngs)
-
+  def __init__(self, cfg: _ModelConfig, *, rngs: nnx.Rngs, mesh):
     self._cfg = cfg
+    self.q_proj = MultiheadLinear('q', cfg, rngs=rngs, mesh=mesh)
+    self.k_proj = MultiheadLinear('k', cfg, rngs=rngs, mesh=mesh)
+    self.v_proj = MultiheadLinear('v', cfg, rngs=rngs, mesh=mesh)
+
+    attn_winit_final = nnx.initializers.variance_scaling(self._cfg.attn_winit_final_mult / self._cfg.num_layers, 'fan_in', 'truncated_normal')
+    kernel_init = nnx.with_partitioning(attn_winit_final, P(None, 'model'))
+    bias_init = nnx.with_partitioning(nnx.initializers.zeros_init(), P('model'))
+    self.final_linear = nnx.Linear(in_features=self._cfg.num_heads * self._cfg.value_size, out_features=self._cfg.d_model, kernel_init=kernel_init, bias_init=bias_init, rngs=rngs)
+
+    
 
   def __call__(self, q_input: jnp.ndarray, kv_input: jnp.ndarray,
                mask: jnp.ndarray) -> jnp.ndarray:
@@ -319,8 +313,12 @@ class TriblockdiagMHA(nnx.Module):
     k = self.k_proj(kv_input)
     v = self.v_proj(kv_input)
 
-    k = jnp.pad(k, ((0, 0), (1, 1), (0, 0), (0, 0), (0, 0)))
-    v = jnp.pad(v, ((0, 0), (1, 1), (0, 0), (0, 0), (0, 0)))
+    # k = jnp.pad(k, ((0, 0), (1, 1), (0, 0), (0, 0), (0, 0)))
+    # v = jnp.pad(v, ((0, 0), (1, 1), (0, 0), (0, 0), (0, 0)))
+    # add one empty block either side without duplicating the big tensor
+    _zero = lambda x: jnp.zeros_like(x[:, :1])
+    k = jnp.concatenate([_zero(k), k, _zero(k)], axis=1)
+    v = jnp.concatenate([_zero(v), v, _zero(v)], axis=1)
 
     def qk_prod(queries, keys):
       return jnp.einsum('bnqhd,bnkhd->bnhqk', queries, keys)
@@ -359,19 +357,18 @@ class TriblockdiagMHA(nnx.Module):
 
 class MHA(nnx.Module):
   """Multi head attention."""
-  def __init__(self, cfg: _ModelConfig, *, rngs: nnx.Rngs):
-    self.q_proj = MultiheadLinear('q', cfg, rngs=rngs)
-    self.k_proj = MultiheadLinear('k', cfg, rngs=rngs)
-    self.v_proj = MultiheadLinear('v', cfg, rngs=rngs)
-
-    attn_winit_final = nnx.initializers.variance_scaling(self._cfg.attn_winit_final_mult / self._cfg.num_layers, 
-                                                         'fan_in', 'truncated_normal')
-    self.final_linear = nnx.Linear(in_features=self._cfg.num_heads * self._cfg.value_size, 
-                                   out_features=self._cfg.d_model, 
-                                   kernel_init=attn_winit_final, 
-                                   rngs=self.rngs)
-
+  def __init__(self, cfg: _ModelConfig, *, rngs: nnx.Rngs, mesh):
     self._cfg = cfg
+    self.q_proj = MultiheadLinear('q', cfg, rngs=rngs, mesh=mesh)
+    self.k_proj = MultiheadLinear('k', cfg, rngs=rngs, mesh=mesh)
+    self.v_proj = MultiheadLinear('v', cfg, rngs=rngs, mesh=mesh)
+
+    attn_winit_final = nnx.initializers.variance_scaling(self._cfg.attn_winit_final_mult / self._cfg.num_layers, 'fan_in', 'truncated_normal')
+    kernel_init = nnx.with_partitioning(attn_winit_final, P(None, 'model'))
+    bias_init = nnx.with_partitioning(nnx.initializers.zeros_init(), P('model'))
+    self.final_linear = nnx.Linear(in_features=self._cfg.num_heads * self._cfg.value_size, out_features=self._cfg.d_model, kernel_init=kernel_init, bias_init=bias_init, rngs=rngs)
+
+    
 
   def __call__(self, q_input: jnp.ndarray, kv_input: jnp.ndarray,
                mask: jnp.ndarray, normalize_logits: bool = True) -> jnp.ndarray:
@@ -404,20 +401,18 @@ class MHA(nnx.Module):
 
 class SplashMHA(nnx.Module):
   """Splash attention."""
-  def __init__(self, cfg: _ModelConfig, *, rngs: nnx.Rngs):
-    self.q_proj = MultiheadLinear('q', cfg, rngs=rngs)
-    self.k_proj = MultiheadLinear('k', cfg, rngs=rngs)
-    self.v_proj = MultiheadLinear('v', cfg, rngs=rngs)
-
-    attn_winit_final = nnx.initializers.variance_scaling(self._cfg.attn_winit_final_mult / self._cfg.num_layers, 
-                                                         'fan_in', 'truncated_normal')
-
-    self.final_linear = nnx.Linear(in_features=self._cfg.num_heads * self._cfg.value_size, 
-                              out_features=self._cfg.d_model, 
-                              kernel_init=attn_winit_final, 
-                              rngs=self.rngs)
-
+  def __init__(self, cfg: _ModelConfig, *, rngs: nnx.Rngs, mesh):
     self._cfg = cfg
+    self.q_proj = MultiheadLinear('q', cfg, rngs=rngs, mesh=mesh)
+    self.k_proj = MultiheadLinear('k', cfg, rngs=rngs, mesh=mesh)
+    self.v_proj = MultiheadLinear('v', cfg, rngs=rngs, mesh=mesh)
+
+    attn_winit_final = nnx.initializers.variance_scaling(self._cfg.attn_winit_final_mult / self._cfg.num_layers, 'fan_in', 'truncated_normal')
+    kernel_init = nnx.with_partitioning(attn_winit_final, P(None, 'model'))
+    bias_init = nnx.with_partitioning(nnx.initializers.zeros_init(), P('model'))
+    self.final_linear = nnx.Linear(in_features=self._cfg.num_heads * self._cfg.value_size, out_features=self._cfg.d_model, kernel_init=kernel_init, bias_init=bias_init, rngs=rngs)
+
+    
 
   def __call__(self, q_input: jnp.ndarray, kv_input: jnp.ndarray,
                mask: jnp.ndarray | splash_attention.splash_attention_mask.Mask,
@@ -463,34 +458,34 @@ class SplashMHA(nnx.Module):
 class Block(nnx.Module):
   """Transformer block (mha and ffw)."""
 
-  def __init__(self, cfg: _ModelConfig, mask: jnp.ndarray, num_nodes: int,
-               num_padding_nodes: Tuple[int, int] | int, *, rngs: nnx.Rngs):
+  def __init__(self, cfg: _ModelConfig, mask: jnp.ndarray,
+               num_padding_nodes: Tuple[int, int] | int, *, rngs: nnx.Rngs, mesh):
     self._cfg = cfg
     self.mask = mask
-    self.num_nodes = num_nodes
     self.num_padding_nodes = num_padding_nodes
 
     # Instantiate attention and FFW modules in __init__
     if self._cfg.attention_type == 'triblockdiag_mha':
-      self.attn_module = TriblockdiagMHA(cfg, rngs=rngs)
+      self.attn_module = TriblockdiagMHA(cfg, rngs=rngs, mesh=mesh)
     elif self._cfg.attention_type == 'mha':
-      self.attn_module = MHA(cfg, rngs=rngs)
+      self.attn_module = MHA(cfg, rngs=rngs, mesh=mesh)
     elif self._cfg.attention_type == 'splash_mha':
-      self.attn_module = SplashMHA(cfg, rngs=rngs)
+      self.attn_module = SplashMHA(cfg, rngs=rngs, mesh=mesh)
     else:
       raise NotImplementedError()
 
-    self.ffw_module = FeedForward(cfg, rngs=rngs)
+    self.ffw_module = FeedForward(cfg, rngs=rngs, mesh=mesh)
 
-    # Instantiate LinearNormConditioning and LayerNorm
-    self.norm_cond_attn = mlp_builder.LinearNormConditioning(feature_size=self._cfg.d_model, rngs=rngs)
-    self.norm_cond_ffw = mlp_builder.LinearNormConditioning(feature_size=self._cfg.d_model, rngs=rngs)
-    self.ln1 = nnx.LayerNorm(features=self._cfg.d_model, use_scale=False, use_bias=False, rngs=rngs)
-    self.ln2 = nnx.LayerNorm(features=self._cfg.d_model, use_scale=False, use_bias=False, rngs=rngs)
+    # LayerNorm and LinearNormConditioning
+    self.norm_cond_attn = mlp_builder.LinearNormConditioning(feature_size=self._cfg.d_model, rngs=rngs, mesh=mesh)
+    self.norm_cond_ffw = mlp_builder.LinearNormConditioning(feature_size=self._cfg.d_model, rngs=rngs, mesh=mesh)
+    self.ln1 = nnx.LayerNorm(num_features=self._cfg.d_model, use_scale=False, use_bias=False, rngs=rngs)
+    self.ln2 = nnx.LayerNorm(num_features=self._cfg.d_model, use_scale=False, use_bias=False, rngs=rngs)
 
 
   def __call__(self, x: jnp.ndarray, global_norm_conditioning: jax.Array):
     # x shape is (batch, num_nodes, feature_dim)
+    num_nodes = x.shape[1]
     def call_attn(x_in):
       if self._cfg.attention_type == 'triblockdiag_mha':
         # We pad -> reshape -> compute attn -> reshape -> select at each block
@@ -504,9 +499,9 @@ class Block(nnx.Module):
                                       x_padded.shape[-1])
         x_attn = self.attn_module(x_reshaped, x_reshaped, mask=self.mask)
         x_attn_reshaped = x_attn.reshape(x_attn.shape[0],
-                                          self.num_nodes + self.num_padding_nodes,
-                                          x_attn.shape[-1])
-        return x_attn_reshaped[:,:self.num_nodes, :]
+                                         num_nodes + self.num_padding_nodes,
+                                         x_attn.shape[-1])
+        return x_attn_reshaped[:, :num_nodes, :]
 
       elif self._cfg.attention_type == 'mha':
         return self.attn_module(x_in, x_in, mask=self.mask)
@@ -515,7 +510,7 @@ class Block(nnx.Module):
         # Add padding so that number of nodes is divisible by block sizes.
         x_padded = jnp.pad(x_in, ((0, 0), (0, self.num_padding_nodes[0]), (0, 0)))
         x_attn = self.attn_module(x_padded, x_padded, mask=self.mask)
-        return x_attn[:,:self.num_nodes, :]
+        return x_attn[:, :num_nodes, :]
 
       else:
         raise NotImplementedError()
@@ -546,18 +541,21 @@ class Transformer(nnx.Module):
                num_heads: int = 1,
                *,
                rngs: nnx.Rngs,
+               mesh,
                block_q: Optional[int] = None,
                block_kv: Optional[int] = None,
                block_kv_compute: Optional[int] = None,
                block_q_dkv: Optional[int] = None,
                block_kv_dkv: Optional[int] = None,
                block_kv_dkv_compute: Optional[int] = None,
+               use_gradient_checkpointing: bool = False,
                **kwargs):
 
     # Construct mask and deduce block size.
     mask = adj_mat ** attention_k_hop
     mask_block_size = get_mask_block_size(mask)
     logging.info('mask_block_size: %s.', mask_block_size)
+    print('mask_block_size:', mask_block_size, flush=True)
 
     if attention_type == 'triblockdiag_mha':
       # we will stack the nodes in blocks of 'block_size' nodes, so we need to
@@ -609,20 +607,19 @@ class Transformer(nnx.Module):
 
     # Instantiate all Block modules
     self.blocks = []
-    for _ in range(self._cfg.num_layers):
-      self.blocks.append(
-          Block(cfg=self._cfg, 
-                mask=self.mask,
-                num_nodes=adj_mat.shape[0], # Pass actual num_nodes from adj_mat
-                num_padding_nodes=self.num_padding_nodes,
-                rngs=rngs # Pass rngs to sub-modules
-                )
-      )
+    for i in range(self._cfg.num_layers):
+      block = Block(cfg=self._cfg, mask=self.mask, num_padding_nodes=self.num_padding_nodes, rngs=rngs, mesh=mesh)
+      
+      # Apply gradient checkpointing to every other block if requested
+      if use_gradient_checkpointing and i % 2 == 0:
+        block = nnx.remat(block)
+      
+      self.blocks.append(block)
 
     # Final LayerNorm and LinearNormConditioning
-    self.final_ln = nnx.LayerNorm(features=self._cfg.d_model, use_scale=False, use_bias=False, rngs=rngs)
+    self.final_ln = nnx.LayerNorm(num_features=self._cfg.d_model, use_scale=False, use_bias=False, rngs=rngs)
     self.final_norm_cond = mlp_builder.LinearNormConditioning(
-        feature_size=self._cfg.d_model, rngs=rngs)
+        feature_size=self._cfg.d_model, rngs=rngs, mesh=mesh)
 
   def __call__(self, node_features: jnp.ndarray, global_norm_conditioning: jax.Array):
     # node_features expected to have shape (batch, num_nodes, d)

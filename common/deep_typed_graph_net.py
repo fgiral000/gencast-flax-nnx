@@ -58,8 +58,6 @@ def _get_activation_fn(name):
   """Return activation function corresponding to function_name."""
   if name == "identity":
     return lambda x: x
-  if hasattr(nnx, name):
-    return getattr(nnx, name)
   if hasattr(jax.nn, name):
     return getattr(jax.nn, name)
   if hasattr(jnp, name):
@@ -85,8 +83,10 @@ def _build_update_fns_for_node_types(
     use_layer_norm: bool,
     use_norm_conditioning: bool,
     rngs: nnx.Rngs,
+    mesh,
     input_sizes: Optional[Mapping[str, int]] = None,
-    output_sizes: Optional[Mapping[str, int]] = None
+    output_sizes: Optional[Mapping[str, int]] = None,
+    is_interaction_network: bool = False,
 ) -> Mapping[str, nnx.Module]: # Returns a dict of instantiated NNX modules
   """Builds an update function for all node types or a subset of them."""
   output_fns = {}
@@ -104,8 +104,13 @@ def _build_update_fns_for_node_types(
     else:
       current_input_size = input_sizes[node_set_name]
 
+    for edge_set_key, edge_set in graph_template.edges.items():
+      receiver_node_set_key = edge_set_key.node_sets[1]
+    is_receiver = node_set_name == receiver_node_set_key
+
     output_fns[node_set_name] = builder_fn(
-      mlp_input_size=current_input_size,
+      mlp_input_size=current_input_size * 2 if (is_interaction_network and is_receiver) else current_input_size,
+      # mlp_input_size=current_input_size * 2 if is_interaction_network else current_input_size,
       mlp_hidden_size=mlp_hidden_size,
       mlp_num_hidden_layers=mlp_num_hidden_layers,
       mlp_output_size=output_size,
@@ -113,6 +118,7 @@ def _build_update_fns_for_node_types(
       use_layer_norm=use_layer_norm,
       use_norm_conditioning=use_norm_conditioning,
       rngs=rngs,
+      mesh=mesh,
     )
   return output_fns
 
@@ -127,8 +133,10 @@ def _build_update_fns_for_edge_types(
     use_layer_norm: bool,
     use_norm_conditioning: bool,
     rngs: nnx.Rngs,
+    mesh,
     input_sizes: Optional[Mapping[typed_graph.EdgeSetKey, int]] = None,
-    output_sizes: Optional[Mapping[str, int]] = None
+    output_sizes: Optional[Mapping[str, int]] = None,
+    is_interaction_network: bool = False,
 ) -> Mapping[str, nnx.Module]: # Returns a dict of instantiated NNX modules
   """Builds an edge function for all edge types or a subset of them."""
   output_fns = {}
@@ -143,13 +151,13 @@ def _build_update_fns_for_edge_types(
 
     current_input_size = None
     if input_sizes is None:
-      current_input_size = graph_template.edges[edge_set_key].features.shape[-1]
+      current_input_size = graph_template.edges[edge_set_key].features.shape[-1] if graph_template.edges[edge_set_key].features is not None else 0
     else:
       # Note: input_sizes for edges are typically keyed by EdgeSetKey, not just name string
       current_input_size = input_sizes[edge_set_name]
 
     output_fns[edge_set_name] = builder_fn(
-        mlp_input_size=current_input_size,
+        mlp_input_size=current_input_size * 3 if is_interaction_network else current_input_size,
         mlp_hidden_size=mlp_hidden_size,
         mlp_num_hidden_layers=mlp_num_hidden_layers,
         mlp_output_size=output_size,
@@ -157,6 +165,7 @@ def _build_update_fns_for_edge_types(
         use_layer_norm=use_layer_norm,
         use_norm_conditioning=use_norm_conditioning,
         rngs=rngs,
+        mesh=mesh,
     )
   return output_fns
 
@@ -211,7 +220,9 @@ class DeepTypedGraphNet(nnx.Module):
                f32_aggregation: bool = False,
                aggregate_edges_for_nodes_fn: str = "segment_sum",
                aggregate_normalization: Optional[float] = None,
-               rngs: nnx.Rngs):
+               rngs: nnx.Rngs,
+               mesh,
+               graph_template: Optional[typed_graph.TypedGraph] = None):
     """Inits the model.
 
     Args:
@@ -256,6 +267,9 @@ class DeepTypedGraphNet(nnx.Module):
         increase the number of edges connected to a node. In particular, this is
         useful when using segment_sum, but should not be combined with
         segment_mean.
+      graph_template: Optional TypedGraph template for eager initialization.
+        If provided, networks will be initialized immediately. If None,
+        networks will be initialized lazily on first call.
       name: Name of the model.
     """
     # Store all parameters except graph_template
@@ -283,7 +297,7 @@ class DeepTypedGraphNet(nnx.Module):
     self._aggregate_edges_for_nodes_fn = _get_aggregate_edges_for_nodes_fn(
         aggregate_edges_for_nodes_fn)
     self._aggregate_normalization = aggregate_normalization
-    self._rngs = rngs # Store the RNGs for lazy initialization
+    self._mesh = mesh # Store the mesh for lazy initialization
 
     if aggregate_normalization:
       assert aggregate_edges_for_nodes_fn == "segment_sum"
@@ -292,8 +306,12 @@ class DeepTypedGraphNet(nnx.Module):
     self.embedder_network: Optional[typed_graph_net.GraphMapFeatures] = None
     self.processor_networks: Optional[List[typed_graph_net.InteractionNetwork]] = None
     self.decoder_network: Optional[typed_graph_net.GraphMapFeatures] = None
+    
+    # If graph_template is provided, initialize networks eagerly
+    if graph_template is not None:
+      self._initialize_networks(graph_template, rngs)
 
-  def _initialize_networks(self, graph_template: typed_graph.TypedGraph):
+  def _initialize_networks(self, graph_template: typed_graph.TypedGraph, rngs: nnx.Rngs):
     """Initializes all sub-networks using the provided graph_template."""
     # The embedder graph network independently embeds edge and node features.
     embed_edge_fn = None
@@ -306,7 +324,8 @@ class DeepTypedGraphNet(nnx.Module):
           activation=self._activation,
           use_layer_norm=self._use_layer_norm,
           use_norm_conditioning=self._use_norm_conditioning,
-          rngs=self._rngs,
+          rngs=rngs,
+          mesh=self._mesh,
           input_sizes=None, # Inferred from graph_template
           output_sizes=self._edge_latent_size)
 
@@ -320,13 +339,14 @@ class DeepTypedGraphNet(nnx.Module):
           activation=self._activation,
           use_layer_norm=self._use_layer_norm,
           use_norm_conditioning=self._use_norm_conditioning,
-          rngs=self._rngs,
+          rngs=rngs,
+          mesh=self._mesh,
           input_sizes=None, # Inferred from graph_template
           output_sizes=self._node_latent_size)
 
     self.embedder_network = typed_graph_net.GraphMapFeatures(
-        embed_edge_fn=embed_edge_fn,
-        embed_node_fn=embed_node_fn,
+        embed_edge_fns=embed_edge_fn,
+        embed_node_fns=embed_node_fn,
     )
 
     if self._f32_aggregation:
@@ -351,7 +371,7 @@ class DeepTypedGraphNet(nnx.Module):
     for _ in range(self._num_message_passing_steps):
       self.processor_networks.append(
           typed_graph_net.InteractionNetwork(
-              update_edge_fn=_build_update_fns_for_edge_types(
+              update_edge_fns=_build_update_fns_for_edge_types(
                   builder_fn=mlp_builder.MLPWithNormConditioning,
                   graph_template=graph_template,
                   mlp_hidden_size=self._mlp_hidden_size,
@@ -359,10 +379,12 @@ class DeepTypedGraphNet(nnx.Module):
                   activation=self._activation,
                   use_layer_norm=self._use_layer_norm,
                   use_norm_conditioning=self._use_norm_conditioning,
-                  rngs=self._rngs,
+                  rngs=rngs,
+                  mesh=self._mesh,
                   input_sizes=self._edge_latent_size,
-                  output_sizes=self._edge_latent_size),
-              update_node_fn=_build_update_fns_for_node_types(
+                  output_sizes=self._edge_latent_size,
+                  is_interaction_network= True),
+              update_node_fns=_build_update_fns_for_node_types(
                   builder_fn=mlp_builder.MLPWithNormConditioning,
                   graph_template=graph_template,
                   mlp_hidden_size=self._mlp_hidden_size,
@@ -370,9 +392,11 @@ class DeepTypedGraphNet(nnx.Module):
                   activation=self._activation,
                   use_layer_norm=self._use_layer_norm,
                   use_norm_conditioning=self._use_norm_conditioning,
-                  rngs=self._rngs, 
+                  rngs=rngs,
+                  mesh=self._mesh,
                   input_sizes=self._node_latent_size,
-                  output_sizes=self._node_latent_size),
+                  output_sizes=self._node_latent_size,
+                  is_interaction_network= True),
               aggregate_edges_for_nodes_fn=aggregate_fn,
               include_sent_messages_in_node_update=(
                   self._include_sent_messages_in_node_update),
@@ -390,7 +414,8 @@ class DeepTypedGraphNet(nnx.Module):
             activation=self._activation,
             use_layer_norm=False, # Output MLPs usually don't have layer norm
             use_norm_conditioning=False, # Output MLPs usually don't have conditioning
-            rngs=self._rngs, 
+            rngs=rngs,
+            mesh=self._mesh,
             input_sizes=self._edge_latent_size,
             output_sizes=self._edge_output_size
         )
@@ -404,14 +429,15 @@ class DeepTypedGraphNet(nnx.Module):
             activation=self._activation,
             use_layer_norm=False, # Output MLPs usually don't have layer norm
             use_norm_conditioning=False, # Output MLPs usually don't have conditioning
-            rngs=self._rngs, # Use derived RNGs
+            rngs=rngs, # Use derived RNGs
+            mesh=self._mesh,
             input_sizes=self._node_latent_size,
             output_sizes=self._node_output_size
         )
 
     self.decoder_network = typed_graph_net.GraphMapFeatures(
-        embed_edge_fn=output_edge_fn,
-        embed_node_fn=output_node_fn,
+        embed_edge_fns=output_edge_fn,
+        embed_node_fns=output_node_fn,
     )
 
 
