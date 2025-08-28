@@ -127,7 +127,7 @@ class CheckPoint:
   noise_encoder_config: denoiser.NoiseEncoderConfig
 
 
-class GenCast(nnx.Module, predictor_base.Predictor):
+class GenCast(nnx.Module):
   """Predictor for a denoising diffusion model following the framework of [1].
 
     [1] Elucidating the Design Space of Diffusion-Based Generative Models
@@ -166,19 +166,19 @@ class GenCast(nnx.Module, predictor_base.Predictor):
         + len(task_config.pressure_levels) * num_atmospheric_vars
     )
 
-    self._rngs = rngs
+    self.rngs = rngs
     denoiser_architecture_config.node_output_size = num_outputs
-    self._denoiser = denoiser.Denoiser(
+    self.denoiser = denoiser.Denoiser(
         noise_encoder_config,
         denoiser_architecture_config,
-        rngs=self._rngs,
+        rngs=self.rngs,
     )
     self._sampler_config = sampler_config
     self._noise_config = noise_config
     # Singleton to avoid re-initializing the sampler for each inference call.
     self._sampler = dpm_solver_plus_plus_2s.Sampler(
-          self._denoiser,
-          rngs=self._rngs,
+          self.denoiser,
+          rngs=self.rngs,
           **self._sampler_config,
       )
     
@@ -207,7 +207,7 @@ class GenCast(nnx.Module, predictor_base.Predictor):
       forcings: Optional[xarray.Dataset] = None,
       **kwargs) -> xarray.Dataset:
     """The preconditioned denoising function D from the paper (Eqn 7)."""
-    raw_predictions = self._denoiser(
+    raw_predictions = self.denoiser(
         inputs=inputs,
         noisy_targets=noisy_targets * self._c_in(noise_levels),
         noise_levels=noise_levels,
@@ -235,7 +235,7 @@ class GenCast(nnx.Module, predictor_base.Predictor):
 
     # Sample noise levels:
     dtype = casting.infer_floating_dtype(targets)  # pytype: disable=wrong-arg-types
-    key = self._rngs.params()
+    key = self.rngs.noise()
     batch_size = inputs.sizes['batch']
     noise_levels = xarray_jax.DataArray(
         data=samplers_utils.rho_inverse_cdf(
@@ -247,7 +247,7 @@ class GenCast(nnx.Module, predictor_base.Predictor):
 
     # Sample noise and apply it to targets:
     noise = (
-        samplers_utils.spherical_white_noise_like(targets, rngs=self._rngs) * noise_levels
+        samplers_utils.spherical_white_noise_like(targets, rngs=self.rngs) * noise_levels
     )
     noisy_targets = targets + noise
 
@@ -282,4 +282,11 @@ class GenCast(nnx.Module, predictor_base.Predictor):
                targets_template: xarray.Dataset,
                forcings: Optional[xarray.Dataset] = None,
                **kwargs) -> xarray.Dataset:
+    return self.denoiser(inputs, targets_template, forcings, **kwargs)
+
+  def full_sampling(self,
+                    inputs: xarray.Dataset,
+                    targets_template: xarray.Dataset,
+                    forcings: Optional[xarray.Dataset] = None,
+                    **kwargs) -> xarray.Dataset:
     return self._sampler(inputs, targets_template, forcings, **kwargs)

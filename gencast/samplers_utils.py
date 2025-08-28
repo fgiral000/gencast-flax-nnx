@@ -320,7 +320,7 @@ def spherical_white_noise_like(template: xarray.Dataset, rngs: nnx.Rngs) -> xarr
   """Samples isotropic mean 0 variance 1 white noise on the sphere."""
   def spherical_white_noise_like_dataarray(data_array: xarray.DataArray) -> xarray.DataArray:
       num_wavenumbers = data_array.lon.shape[0] // 2
-      key = rngs.params()  # Generate a new key from the 'params' stream
+      key = rngs.noise()  # Generate a new key from the 'noise' stream
       return sample(
           key=key,
           power_spectrum=xarray_jax.DataArray(

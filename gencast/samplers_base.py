@@ -15,9 +15,8 @@
 
 import abc
 from typing import Optional
-
-from gencast import denoisers_base
 import xarray
+import flax.nnx as nnx
 
 
 class Sampler(abc.ABC):
@@ -26,9 +25,7 @@ class Sampler(abc.ABC):
   This is constructed with a denoising function, and uses it to draw samples.
   """
 
-  _denoiser: denoisers_base.Denoiser
-
-  def __init__(self, denoiser: denoisers_base.Denoiser):
+  def __init__(self, denoiser: nnx.Module):
     """Constructs Sampler.
 
     Args:
