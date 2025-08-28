@@ -26,6 +26,7 @@ from gencast import sparse_transformer
 from gencast import transformer
 from common import typed_graph
 from common import xarray_jax
+from common import mlp as mlp_builder
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -38,84 +39,7 @@ Kwargs = Mapping[str, Any]
 NoiseLevelEncoder = Callable[[jnp.ndarray], jnp.ndarray]
 
 
-class FourierFeaturesMLP(nnx.Module):
-  """A simple MLP applied to Fourier features of values or their logarithms."""
 
-  def __init__(self,
-               base_period: float,
-               num_frequencies: int,
-               output_sizes: Sequence[int],
-               apply_log_first: bool = False,
-               w_init: Optional[nnx.Initializer] = None,
-               activation: Callable = jax.nn.gelu,
-               rngs: nnx.Rngs = nnx.Rngs(0),
-               **mlp_kwargs
-               ):
-    """Initializes the module.
-
-    Args:
-      base_period:
-        See model_utils.fourier_features. Note this would apply to log inputs if
-        apply_log_first is used.
-      num_frequencies:
-        See model_utils.fourier_features.
-      output_sizes:
-        Layer sizes for the MLP.
-      apply_log_first:
-        Whether to take the log of the inputs before computing Fourier features.
-      w_init:
-        Weights initializer for the MLP, default setting aims to produce
-        approx unit-variance outputs given the input sin/cos features.
-      activation:
-        Activation function for the MLP layers.
-      rngs:
-        Random number generator state for parameter initialization.
-      **mlp_kwargs:
-        Further settings for the MLP.
-    """
-    self.base_period = base_period
-    self.num_frequencies = num_frequencies
-    self.apply_log_first = apply_log_first
-    
-    if w_init is None:
-      # Scale of 2 is appropriate for input layer as sin/cos fourier features
-      # have variance 0.5 for random inputs. Also reasonable to use for later
-      # layers as relu activation cuts variance in half for inputs to later
-      # layers and gelu something close enough too.
-      w_init = nnx.initializers.variance_scaling(
-          2.0, mode="fan_in", distribution="uniform"
-      )
-    
-    # Calculate input features: Fourier features produce 2 * num_frequencies outputs
-    # (sin and cos for each frequency)
-    fourier_features_size = 2 * num_frequencies
-    
-    # Create MLP layers
-    layers = []
-    in_features = fourier_features_size
-    
-    for i, output_size in enumerate(output_sizes):
-      layers.append(nnx.Linear(
-          in_features=in_features,
-          out_features=output_size,
-          kernel_init=w_init,
-          rngs=rngs,
-          **mlp_kwargs
-      ))
-      if i < len(output_sizes) - 1:  # Don't add activation after last layer
-        layers.append(nnx.Lambda(activation))
-      in_features = output_size  # Update for next layer
-    
-    self.mlp = nnx.Sequential(*layers)
-
-  def __call__(self, values: jnp.ndarray) -> jnp.ndarray:
-    if self.apply_log_first:
-      values = jnp.log(values)
-
-    features = model_utils.fourier_features(
-        values, self.base_period, self.num_frequencies)
-
-    return self.mlp(features)
   
 
 
@@ -234,16 +158,16 @@ class Denoiser(nnx.Module):
       denoiser_architecture_config: DenoiserArchitectureConfig,
       rngs: nnx.Rngs,
   ):
-    self._rngs = rngs
-    self._predictor = _DenoiserArchitecture(
+    self.rngs = rngs
+    self.predictor = DenoiserArchitecture(
         denoiser_architecture_config=denoiser_architecture_config,
-        rngs=self._rngs,
+        rngs=self.rngs,
     )
     # Use default values if not specified.
     if noise_encoder_config is None:
       noise_encoder_config = NoiseEncoderConfig()
-    self._noise_level_encoder = FourierFeaturesMLP(**noise_encoder_config,
-                                                   rngs=self._rngs)
+    self.noise_level_encoder = mlp_builder.FourierFeaturesMLP(**noise_encoder_config,
+                                                   rngs=self.rngs)
 
   def __call__(
       self,
@@ -257,7 +181,7 @@ class Denoiser(nnx.Module):
 
     if noise_levels.dims != ("batch",):
       raise ValueError("noise_levels expected to be shape (batch,).")
-    noise_level_encodings = self._noise_level_encoder(
+    noise_level_encodings = self.noise_level_encoder(
         xarray_jax.unwrap_data(noise_levels)
     )
     noise_level_encodings = xarray_jax.Variable(
@@ -265,14 +189,14 @@ class Denoiser(nnx.Module):
     )
     inputs = inputs.assign(noise_level_encodings=noise_level_encodings)
 
-    return self._predictor(
+    return self.predictor(
         inputs=inputs,
         targets_template=noisy_targets,
         forcings=forcings,
         **kwargs)
 
 
-class _DenoiserArchitecture(nnx.Module):
+class DenoiserArchitecture(nnx.Module):
   """GenCast Predictor.
 
   The model works on graphs that take into account:
@@ -315,7 +239,7 @@ class _DenoiserArchitecture(nnx.Module):
         relative_longitude_local_coordinates=True,
         relative_latitude_local_coordinates=True,
     )
-    self._rngs = rngs
+    self.rngs = rngs
     # Construct the mesh.
     mesh = icosahedral_mesh.get_last_triangular_mesh_for_sphere(
         splits=denoiser_architecture_config.mesh_size
@@ -326,7 +250,7 @@ class _DenoiserArchitecture(nnx.Module):
 
     # Encoder, which moves data from the grid to the mesh with a single message
     # passing step.
-    self._grid2mesh_gnn = (
+    self.grid2mesh_gnn = (
         deep_typed_graph_net.DeepTypedGraphNet(
             activation="swish",
             aggregate_normalization=(
@@ -349,22 +273,22 @@ class _DenoiserArchitecture(nnx.Module):
             num_message_passing_steps=1,
             use_layer_norm=True,
             use_norm_conditioning=True,
-            rngs=self._rngs,
+            rngs=self.rngs,
         )
     )
 
     # Processor - performs multiple rounds of message passing on the mesh.
-    self._mesh_gnn = transformer.MeshTransformer(
+    self.mesh_gnn = transformer.MeshTransformer(
         transformer_ctor=sparse_transformer.Transformer,
         transformer_kwargs=dataclasses.asdict(
             denoiser_architecture_config.sparse_transformer_config
         ),
-        rngs=self._rngs,
+        rngs=self.rngs,
     )
 
     # Decoder, which moves data from the mesh back into the grid with a single
     # message passing step.
-    self._mesh2grid_gnn = (
+    self.mesh2grid_gnn = (
         deep_typed_graph_net.DeepTypedGraphNet(
             activation="swish",
             edge_latent_size=dict(
@@ -385,7 +309,7 @@ class _DenoiserArchitecture(nnx.Module):
             num_message_passing_steps=1,
             use_layer_norm=True,
             use_norm_conditioning=True,
-            rngs=self._rngs,
+            rngs=self.rngs,
         )
     )
 
@@ -695,7 +619,7 @@ class _DenoiserArchitecture(nnx.Module):
         })
 
     # Run the GNN.
-    grid2mesh_out = self._grid2mesh_gnn(input_graph, global_norm_conditioning)
+    grid2mesh_out = self.grid2mesh_gnn(input_graph, global_norm_conditioning)
     latent_mesh_nodes = grid2mesh_out.nodes["mesh_nodes"].features
     latent_grid_nodes = grid2mesh_out.nodes["grid_nodes"].features
     return latent_mesh_nodes, latent_grid_nodes
@@ -735,7 +659,7 @@ class _DenoiserArchitecture(nnx.Module):
         edges={mesh_edges_key: new_edges}, nodes={"mesh_nodes": nodes})
 
     # Run the GNN.
-    return self._mesh_gnn(input_graph,
+    return self.mesh_gnn(input_graph,
                           global_norm_conditioning=global_norm_conditioning
                           ).nodes["mesh_nodes"].features
 
@@ -774,7 +698,7 @@ class _DenoiserArchitecture(nnx.Module):
         })
 
     # Run the GNN.
-    output_graph = self._mesh2grid_gnn(input_graph, global_norm_conditioning)
+    output_graph = self.mesh2grid_gnn(input_graph, global_norm_conditioning)
     output_grid_nodes = output_graph.nodes["grid_nodes"].features
 
     return output_grid_nodes

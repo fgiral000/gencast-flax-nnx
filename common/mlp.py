@@ -29,7 +29,8 @@ import jax.numpy as jnp
 import jraph
 import flax.nnx as nnx
 from jax.sharding import NamedSharding, PartitionSpec as P
-
+from typing import Sequence, Callable
+from common import model_utils
 import functools
 from typing import Optional
 
@@ -48,7 +49,6 @@ class LinearNormConditioning(nnx.Module):
   def __init__(self, 
                feature_size: int,
                rngs: nnx.Rngs,
-               mesh,
                conditioning_dim: Optional[int] = None):
     self.feature_size = feature_size
     # mesh is now required
@@ -86,7 +86,7 @@ class MLP(nnx.Module):
                activation,
                *,
                rngs: nnx.Rngs,
-               mesh):
+               ):
     """Initializes the MLP module."""
     layers = []
     feature_size = mlp_input_size
@@ -143,7 +143,6 @@ class MLPWithNormConditioning(nnx.Module):
                use_layer_norm: bool,
                use_norm_conditioning: bool,
                rngs: nnx.Rngs,
-               mesh,
                norm_conditioning_dim: Optional[int] = None,
                use_gradient_checkpointing: bool = False):
     """Initializes the MLP with optional norm conditioning."""
@@ -158,7 +157,6 @@ class MLPWithNormConditioning(nnx.Module):
         mlp_output_size=mlp_output_size,
         activation=activation,
         rngs=rngs,
-        mesh=mesh,
     )
     
     # Apply gradient checkpointing to the network if requested and it's large enough
@@ -183,7 +181,6 @@ class MLPWithNormConditioning(nnx.Module):
           feature_size=mlp_output_size,
           conditioning_dim=norm_conditioning_dim if norm_conditioning_dim is not None else 16,  # Default to 16 if not provided
           rngs=rngs,
-          mesh=mesh
       )
 
   def __call__(self, inputs: jax.Array, global_norm_conditioning: Optional[jax.Array] = None):
@@ -209,35 +206,53 @@ class MLPWithNormConditioning(nnx.Module):
 
 
 
-    
-    
+class FourierFeaturesMLP(nnx.Module):
+    def __init__(
+        self,
+        base_period: float,
+        num_frequencies: int,
+        output_sizes: Sequence[int],
+        apply_log_first: bool = False,
+        w_init: Optional[nnx.Initializer] = None,
+        activation: Callable = jax.nn.gelu,
+        rngs: nnx.Rngs = nnx.Rngs(0),
+        **mlp_kwargs,
+    ):
+        self.base_period = base_period
+        self.num_frequencies = num_frequencies
+        self.apply_log_first = apply_log_first
+        self.activation = activation
 
+        if w_init is None:
+            w_init = nnx.initializers.variance_scaling(
+                2.0, mode="fan_in", distribution="uniform"
+            )
 
+        in_ch = 2 * num_frequencies
+        self.linears = []
+        for out_ch in output_sizes:
+            kernel_init = nnx.with_partitioning(w_init, P(None, 'model'))
+            bias_init   = nnx.with_partitioning(nnx.initializers.zeros_init(), P('model'))
+            lin = nnx.Linear(
+                in_features=in_ch,
+                out_features=out_ch,
+                kernel_init=kernel_init,
+                bias_init=bias_init,
+                rngs=rngs,
+                **mlp_kwargs
+            )
+            setattr(self, f"linear_{len(self.linears)}", lin)
+            self.linears.append(lin)
+            in_ch = out_ch
 
-
-if __name__ == "__main__":
-  # Example usage
-  rngs = nnx.Rngs(0)
-
-  mlp = MLPWithNormConditioning(
-      mlp_input_size=10,
-      mlp_hidden_size=20,
-      mlp_num_hidden_layers=3,
-      mlp_output_size=5,
-      activation=nnx.relu,
-      use_layer_norm=True,
-      use_norm_conditioning=True,
-      rngs=rngs
-  )
-  # Visualize the model architecture
-  # nnx.display(mlp)
-  # This will print the structure of the MLP.
-
-  # Let's use some dummy data to test the MLP
-  dummy_input = jnp.ones((1,10))  # Batch size of 1, input size of 10
-  global_norm_conditioning = jnp.ones((5,))  # Example global norm conditioning
-  
-
-
-  output = mlp(dummy_input, global_norm_conditioning=global_norm_conditioning)
-  print("Output shape:", output.shape)  # Should be (1, 5) for the output size of 5
+    def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
+        if self.apply_log_first:
+            x = jnp.log(x)
+        feats = model_utils.fourier_features(
+            x, self.base_period, self.num_frequencies
+        )
+        for i, lin in enumerate(self.linears):
+            feats = lin(feats)
+            if i < len(self.linears) - 1:
+                feats = self.activation(feats)
+        return feats    

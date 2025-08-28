@@ -13,7 +13,7 @@
 module --force purge
 module load apps/2021
 module load Anaconda3
-module load CUDA/12.1.1
+module load CUDA/12.3.2
 
 source /media/beegfs/home/x249/x249087/.bashrc
 conda activate graphcast_env

@@ -87,6 +87,8 @@ def _build_update_fns_for_node_types(
     input_sizes: Optional[Mapping[str, int]] = None,
     output_sizes: Optional[Mapping[str, int]] = None,
     is_interaction_network: bool = False,
+    edge_latent_size: Optional[Mapping[str, int]] = None,
+    include_sent_messages_in_node_update: bool = False,
 ) -> Mapping[str, nnx.Module]: # Returns a dict of instantiated NNX modules
   """Builds an update function for all node types or a subset of them."""
   output_fns = {}
@@ -104,13 +106,50 @@ def _build_update_fns_for_node_types(
     else:
       current_input_size = input_sizes[node_set_name]
 
-    for edge_set_key, edge_set in graph_template.edges.items():
-      receiver_node_set_key = edge_set_key.node_sets[1]
-    is_receiver = node_set_name == receiver_node_set_key
+    # For interaction networks, calculate the actual input size based on concatenation logic
+    mlp_input_size = current_input_size
+    if is_interaction_network:
+      # In InteractionNetwork, node features are concatenated with aggregated edge features
+      # The concatenation logic in NodeWrapper is:
+      # - include_sent_messages=False: [node_features, received_edge_features] 
+      # - include_sent_messages=True: [node_features, sent_edge_features, received_edge_features]
+      
+      # Check if this node type participates in any edges as a receiver
+      node_receives_edges = any(
+          node_set_name == edge_set_key.node_sets[1]  # receiver is second element
+          for edge_set_key in graph_template.edges.keys()
+      )
+      
+      if node_receives_edges:
+        # Calculate edge feature size
+        edge_feature_size = 0
+        if edge_latent_size is not None:
+          # Use provided edge latent size (should be consistent across edge types)
+          # Take the first available edge latent size as they should be the same
+          edge_feature_size = next(iter(edge_latent_size.values()))
+        else:
+          # Fallback: infer from graph template (for embedding phase)
+          for edge_set_key in graph_template.edges.keys():
+            if node_set_name == edge_set_key.node_sets[1]:
+              edge_features = graph_template.edges[edge_set_key].features
+              if edge_features is not None:
+                edge_feature_size = edge_features.shape[-1]
+                break
+        
+        # Node features + received edge features
+        mlp_input_size = current_input_size + edge_feature_size
+        
+        # If sent messages are included, add another edge feature size
+        if include_sent_messages_in_node_update:
+          node_sends_edges = any(
+              node_set_name == edge_set_key.node_sets[0]  # sender is first element
+              for edge_set_key in graph_template.edges.keys()
+          )
+          if node_sends_edges:
+            mlp_input_size += edge_feature_size
 
     output_fns[node_set_name] = builder_fn(
-      mlp_input_size=current_input_size * 2 if (is_interaction_network and is_receiver) else current_input_size,
-      # mlp_input_size=current_input_size * 2 if is_interaction_network else current_input_size,
+      mlp_input_size=mlp_input_size,
       mlp_hidden_size=mlp_hidden_size,
       mlp_num_hidden_layers=mlp_num_hidden_layers,
       mlp_output_size=output_size,
@@ -342,7 +381,10 @@ class DeepTypedGraphNet(nnx.Module):
           rngs=rngs,
           mesh=self._mesh,
           input_sizes=None, # Inferred from graph_template
-          output_sizes=self._node_latent_size)
+          output_sizes=self._node_latent_size,
+          is_interaction_network=False, # Embedding is not interaction network
+          edge_latent_size=None,
+          include_sent_messages_in_node_update=False)
 
     self.embedder_network = typed_graph_net.GraphMapFeatures(
         embed_edge_fns=embed_edge_fn,
@@ -396,7 +438,9 @@ class DeepTypedGraphNet(nnx.Module):
                   mesh=self._mesh,
                   input_sizes=self._node_latent_size,
                   output_sizes=self._node_latent_size,
-                  is_interaction_network= True),
+                  is_interaction_network=True,
+                  edge_latent_size=self._edge_latent_size,
+                  include_sent_messages_in_node_update=self._include_sent_messages_in_node_update),
               aggregate_edges_for_nodes_fn=aggregate_fn,
               include_sent_messages_in_node_update=(
                   self._include_sent_messages_in_node_update),
@@ -432,7 +476,10 @@ class DeepTypedGraphNet(nnx.Module):
             rngs=rngs, # Use derived RNGs
             mesh=self._mesh,
             input_sizes=self._node_latent_size,
-            output_sizes=self._node_output_size
+            output_sizes=self._node_output_size,
+            is_interaction_network=False, # Output layer is not interaction network
+            edge_latent_size=None,
+            include_sent_messages_in_node_update=False
         )
 
     self.decoder_network = typed_graph_net.GraphMapFeatures(

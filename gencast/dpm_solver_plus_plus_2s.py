@@ -1,21 +1,23 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-DPM-Solver++ 2S sampler for GenSynth CFD diffusion.
-
 Threads an explicit PRNGKey pulled from nnx.Rngs through lax.fori_loop,
-executes purely on raw JAX arrays. Now works with JAX arrays instead of xarray.
+executes purely on raw JAX arrays, and rebuilds final Dataset.
 """
 
 import flax.nnx as nnx
 import jax
 import jax.numpy as jnp
-from typing import Optional, Tuple, Dict
+import xarray as xr
+from typing import Optional, Tuple
 from graphcast import casting
 from gencast import samplers_utils as utils
+from common import xarray_jax
+import gencast.samplers_base as sampler_base
 
 
-class Sampler:
+
+class Sampler(sampler_base.Sampler):
     def __init__(
         self,
         denoiser: nnx.Module,
@@ -28,7 +30,7 @@ class Sampler:
         churn_max_noise_level: float,
         noise_level_inflation_factor: float,
     ):
-        self._noise_levels = utils.edm_noise_schedule(
+        self._noise_levels = utils.noise_schedule(
             max_noise_level, min_noise_level, num_noise_levels, rho
         )
         self._stochastic_churn = stochastic_churn_rate > 0.0
@@ -44,28 +46,23 @@ class Sampler:
 
     def __call__(
         self,
-        noisy_inputs: jnp.ndarray,
-        forcings: Dict[str, jnp.ndarray],
+        inputs: xr.Dataset,
+        targets_template: xr.Dataset,
+        forcings: Optional[xr.Dataset] = None,
         rngs: nnx.Rngs = None,
-    ) -> jnp.ndarray:
-        """
-        Args:
-            noisy_inputs: Shape (batch, node, channels)
-            forcings: Dict with keys like 'case_number', 'U_mag_prev'
-            rngs: Random number generator state
-        
-        Returns:
-            Denoised output with same shape as noisy_inputs
-        """
+    ) -> xr.Dataset:
         if rngs is None:
             raise ValueError("Must pass rngs: nnx.Rngs(...) to Sampler")
         key = rngs.noise()  # pull once, outside any JAX trace
 
-        # Get array template and dtype
-        arr_tmpl = noisy_inputs
-        dtype = arr_tmpl.dtype
+        # 1) pull out raw JAX array from the targets_template
+        da_tmpl = targets_template.to_array()            # dims e.g. ('variable','batch','node')
+        arr_tmpl = xarray_jax.unwrap(da_tmpl)           # pure JAX DeviceArray
+        dims   = da_tmpl.dims
+        coords = da_tmpl.coords
 
         # 2) schedules
+        dtype  = casting.infer_floating_dtype(targets_template)
         sigmas = jnp.array(self._noise_levels, dtype=dtype)
         churns = jnp.array(self._per_step_churn_rates, dtype=dtype)
 
@@ -75,18 +72,31 @@ class Sampler:
             eps = 1e-6  # small epsilon to avoid sigma=0
             sigma_safe = jnp.maximum(sigma, eps)
             
-            # Build noise_levels as a (batch,) array
-            batch_size = x_arr.shape[0]
-            sigma_arr = jnp.full((batch_size,), sigma_safe, dtype=sigma_safe.dtype)
-            
-            return self._preconditioned_denoiser(
-                noisy_inputs=x_arr,
-                noise_levels=sigma_arr,
-                forcings=forcings
+            # rebuild a tiny Dataset for the denoiser
+            da = xarray_jax.DataArray(x_arr, dims=dims, coords=coords)
+            ds = da.to_dataset(dim="variable")
+            # Build noise_levels as a (batch,) DataArray
+            batch_coord = coords["batch"]
+            batch_size  = batch_coord.size
+            sigma_arr   = jnp.full((batch_size,), sigma_safe, dtype=sigma_safe.dtype)
+            nl_da       = xarray_jax.DataArray(
+                sigma_arr,
+                dims=("batch",),
+                coords={"batch": batch_coord},
             )
             
-            # # Cast back to original dtype to maintain consistency
-            # return result.astype(x_arr.dtype)
+            out_ds = self._preconditioned_denoiser(
+                inputs=inputs,
+                noisy_targets=ds,
+                noise_levels=nl_da,
+                forcings=forcings
+            )
+            # extract back to raw array - ensure it's a pure JAX array with correct dtype
+            out_arr = out_ds.to_array()
+            result = xarray_jax.unwrap_data(out_arr)
+            
+            # Cast back to original dtype to maintain consistency
+            return result.astype(x_arr.dtype)
 
         def body_fn(i: jnp.ndarray,
                     state: Tuple[jnp.ndarray, jnp.ndarray]
@@ -114,7 +124,7 @@ class Sampler:
             # 3) Stochastic churn (if enabled)
             # ——————————————————————————————————————————————————————————————
             if self._stochastic_churn:
-                x_arr, sigma, key = utils.apply_stochastic_churn(
+                x_arr, sigma, key = utils.apply_stochastic_churn_arr(
                     x_arr,
                     sigma,
                     churns[i],
@@ -154,37 +164,36 @@ class Sampler:
         init = (jnp.zeros_like(arr_tmpl), key)
         final_arr, _ = jax.lax.fori_loop(0, len(sigmas) - 1, body_fn, init)
 
-        # Return the final JAX array directly
-        return final_arr
+        # 5) wrap back to Dataset using proper xarray_jax functions
+        da_final = xarray_jax.DataArray(final_arr, dims=dims, coords=coords)
+        result_ds = da_final.to_dataset(dim="variable")
+        
+        return result_ds
     
 
     # preconditioning helpers
-    def _c_in(self, sigma: jnp.ndarray) -> jnp.ndarray:
+    def _c_in(self, sigma: xr.DataArray) -> xr.DataArray:
         return (sigma**2 + self.sigma_data**2) ** -0.5
 
-    def _c_out(self, sigma: jnp.ndarray) -> jnp.ndarray:
+    def _c_out(self, sigma: xr.DataArray) -> xr.DataArray:
         return (sigma*self.sigma_data) / ((sigma**2 + self.sigma_data**2) ** 0.5)
 
-    def _c_skip(self, sigma: jnp.ndarray) -> jnp.ndarray:
+    def _c_skip(self, sigma: xr.DataArray) -> xr.DataArray:
         return (self.sigma_data**2) / (sigma**2 + self.sigma_data**2)
 
     def _preconditioned_denoiser(
         self,
-        noisy_inputs: jnp.ndarray,
-        noise_levels: jnp.ndarray,
-        forcings: Dict[str, jnp.ndarray],
-    ) -> jnp.ndarray:
-        """Apply preconditioning to the denoiser input and output."""
-        c_in = self._c_in(noise_levels)
-        # Expand dimensions for broadcasting (batch,) -> (batch, 1, ..., 1)
-        c_in_expanded = c_in.reshape((-1,) + (1,) * (noisy_inputs.ndim - 1))
-        
-        y = noisy_inputs * c_in_expanded
-        raw = self._denoiser(noisy_inputs=y, noise_levels=noise_levels, forcings=forcings)
-        
-        c_out = self._c_out(noise_levels)
-        c_skip = self._c_skip(noise_levels)
-        c_out_expanded = c_out.reshape((-1,) + (1,) * (noisy_inputs.ndim - 1))
-        c_skip_expanded = c_skip.reshape((-1,) + (1,) * (noisy_inputs.ndim - 1))
-        
-        return raw * c_out_expanded + noisy_inputs * c_skip_expanded
+        inputs: xr.Dataset,
+        noisy_targets: xr.Dataset,
+        noise_levels: xr.DataArray,
+        forcings: Optional[xr.Dataset] = None,
+        **kwargs) -> xr.Dataset:
+        """The preconditioned denoising function D from the paper (Eqn 7)."""
+        raw_predictions = self._denoiser(
+            inputs=inputs,
+            noisy_targets=noisy_targets * self._c_in(noise_levels),
+            noise_levels=noise_levels,
+            forcings=forcings,
+            **kwargs)
+        return (raw_predictions * self._c_out(noise_levels) +
+                noisy_targets * self._c_skip(noise_levels))
