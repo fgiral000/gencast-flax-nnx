@@ -156,6 +156,7 @@ def _build_update_fns_for_node_types(
       activation=activation,
       use_layer_norm=use_layer_norm,
       use_norm_conditioning=use_norm_conditioning,
+      norm_conditioning_dim=16,
       rngs=rngs,
       mesh=mesh,
     )
@@ -203,6 +204,7 @@ def _build_update_fns_for_edge_types(
         activation=activation,
         use_layer_norm=use_layer_norm,
         use_norm_conditioning=use_norm_conditioning,
+        norm_conditioning_dim=16,
         rngs=rngs,
         mesh=mesh,
     )
@@ -260,7 +262,7 @@ class DeepTypedGraphNet(nnx.Module):
                aggregate_edges_for_nodes_fn: str = "segment_sum",
                aggregate_normalization: Optional[float] = None,
                rngs: nnx.Rngs,
-               mesh,
+               gpu_mesh,
                graph_template: Optional[typed_graph.TypedGraph] = None):
     """Inits the model.
 
@@ -336,7 +338,7 @@ class DeepTypedGraphNet(nnx.Module):
     self._aggregate_edges_for_nodes_fn = _get_aggregate_edges_for_nodes_fn(
         aggregate_edges_for_nodes_fn)
     self._aggregate_normalization = aggregate_normalization
-    self._mesh = mesh # Store the mesh for lazy initialization
+    self.gpu_mesh = gpu_mesh # Store the mesh for lazy initialization
 
     if aggregate_normalization:
       assert aggregate_edges_for_nodes_fn == "segment_sum"
@@ -364,7 +366,7 @@ class DeepTypedGraphNet(nnx.Module):
           use_layer_norm=self._use_layer_norm,
           use_norm_conditioning=self._use_norm_conditioning,
           rngs=rngs,
-          mesh=self._mesh,
+          mesh=self.gpu_mesh,
           input_sizes=None, # Inferred from graph_template
           output_sizes=self._edge_latent_size)
 
@@ -379,7 +381,7 @@ class DeepTypedGraphNet(nnx.Module):
           use_layer_norm=self._use_layer_norm,
           use_norm_conditioning=self._use_norm_conditioning,
           rngs=rngs,
-          mesh=self._mesh,
+          mesh=self.gpu_mesh,
           input_sizes=None, # Inferred from graph_template
           output_sizes=self._node_latent_size,
           is_interaction_network=False, # Embedding is not interaction network
@@ -422,7 +424,7 @@ class DeepTypedGraphNet(nnx.Module):
                   use_layer_norm=self._use_layer_norm,
                   use_norm_conditioning=self._use_norm_conditioning,
                   rngs=rngs,
-                  mesh=self._mesh,
+                  mesh=self.gpu_mesh,
                   input_sizes=self._edge_latent_size,
                   output_sizes=self._edge_latent_size,
                   is_interaction_network= True),
@@ -435,7 +437,7 @@ class DeepTypedGraphNet(nnx.Module):
                   use_layer_norm=self._use_layer_norm,
                   use_norm_conditioning=self._use_norm_conditioning,
                   rngs=rngs,
-                  mesh=self._mesh,
+                  mesh=self.gpu_mesh,
                   input_sizes=self._node_latent_size,
                   output_sizes=self._node_latent_size,
                   is_interaction_network=True,
@@ -459,7 +461,7 @@ class DeepTypedGraphNet(nnx.Module):
             use_layer_norm=False, # Output MLPs usually don't have layer norm
             use_norm_conditioning=False, # Output MLPs usually don't have conditioning
             rngs=rngs,
-            mesh=self._mesh,
+            mesh=self.gpu_mesh,
             input_sizes=self._edge_latent_size,
             output_sizes=self._edge_output_size
         )
@@ -474,7 +476,7 @@ class DeepTypedGraphNet(nnx.Module):
             use_layer_norm=False, # Output MLPs usually don't have layer norm
             use_norm_conditioning=False, # Output MLPs usually don't have conditioning
             rngs=rngs, # Use derived RNGs
-            mesh=self._mesh,
+            mesh=self.gpu_mesh,
             input_sizes=self._node_latent_size,
             output_sizes=self._node_output_size,
             is_interaction_network=False, # Output layer is not interaction network

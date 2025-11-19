@@ -71,7 +71,7 @@ def unnormalize(values: xarray.Dataset,
   return xarray_tree.map_structure(unnormalize_array, values)
 
 
-class InputsAndResiduals(nnx.Module, base.Predictor):
+class InputsAndResiduals(nnx.Module):
   """Wraps with a residual connection, normalizing inputs and target residuals.
 
   The inner predictor is given inputs that are normalized using `locations`
@@ -105,7 +105,7 @@ class InputsAndResiduals(nnx.Module, base.Predictor):
       stddev_by_level: xarray.Dataset,
       mean_by_level: xarray.Dataset,
       diffs_stddev_by_level: xarray.Dataset):
-    self._predictor = predictor
+    self.predictor = predictor
     self._scales = stddev_by_level
     self._locations = mean_by_level
     self._residual_scales = diffs_stddev_by_level
@@ -154,7 +154,7 @@ class InputsAndResiduals(nnx.Module, base.Predictor):
                ) -> xarray.Dataset:
     norm_inputs = normalize(inputs, self._scales, self._locations)
     norm_forcings = normalize(forcings, self._scales, self._locations)
-    norm_predictions = self._predictor(
+    norm_predictions = self.predictor(
         norm_inputs, targets_template, forcings=norm_forcings, **kwargs)
     return xarray_tree.map_structure(
         lambda pred: self._unnormalize_prediction_and_add_input(inputs, pred),
@@ -172,7 +172,7 @@ class InputsAndResiduals(nnx.Module, base.Predictor):
     norm_target_residuals = xarray_tree.map_structure(
         lambda t: self._subtract_input_and_normalize_target(inputs, t),
         targets)
-    return self._predictor.loss(
+    return self.predictor.loss(
         norm_inputs, norm_target_residuals, forcings=norm_forcings, **kwargs)
 
   def loss_and_predictions(  # pytype: disable=signature-mismatch  # jax-ndarray
@@ -189,9 +189,50 @@ class InputsAndResiduals(nnx.Module, base.Predictor):
     norm_target_residuals = xarray_tree.map_structure(
         lambda t: self._subtract_input_and_normalize_target(inputs, t),
         targets)
-    (loss, scalars), norm_predictions = self._predictor.loss_and_predictions(
+    (loss, scalars), norm_predictions = self.predictor.loss_and_predictions(
         norm_inputs, norm_target_residuals, forcings=norm_forcings, **kwargs)
     predictions = xarray_tree.map_structure(
         lambda pred: self._unnormalize_prediction_and_add_input(inputs, pred),
         norm_predictions)
     return (loss, scalars), predictions
+
+
+  def full_sampling(
+      self,
+      inputs: xarray.Dataset,
+      targets_template: xarray.Dataset,
+      forcings: xarray.Dataset,
+      **kwargs,
+  ) -> xarray.Dataset:
+    """Sampling with normalized inputs and residual predictions.
+
+    Mirrors the logic of `loss` (residual + normalization) but calls
+    `predictor.full_sampling` instead of `predictor.loss`.
+    """
+
+    # 1) Normalize inputs & forcings as in __call__/loss
+    norm_inputs = normalize(inputs, self._scales, self._locations)
+    norm_forcings = normalize(forcings, self._scales, self._locations)
+
+    # 2) Build a *template* in normalized-residual space
+    #    (same transform as in `loss`, but applied to targets_template)
+    norm_target_residuals_template = xarray_tree.map_structure(
+        lambda t: self._subtract_input_and_normalize_target(inputs, t),
+        targets_template,
+    )
+
+    # 3) Call inner model sampling in normalized-residual space
+    norm_predictions = self.predictor.full_sampling(
+        inputs=norm_inputs,
+        targets_template=norm_target_residuals_template,
+        forcings=norm_forcings,
+        **kwargs,
+    )
+
+    # 4) Unnormalize + reapply residual connection (same as __call__)
+    preds = xarray_tree.map_structure(
+        lambda pred: self._unnormalize_prediction_and_add_input(inputs, pred),
+        norm_predictions,
+    )
+
+    return preds

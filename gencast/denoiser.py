@@ -95,8 +95,6 @@ class SparseTransformerConfig:
   attn_winit_final_mult: float = 0.0
   # Number of hidden units in the MLP blocks. Defaults to 4 * d_model.
   ffw_hidden: int = 2048
-  # Name for haiku module.
-  name: Optional[str] = None
 
 
 @chex.dataclass(eq=True)
@@ -157,11 +155,13 @@ class Denoiser(nnx.Module):
       noise_encoder_config: Optional[NoiseEncoderConfig],
       denoiser_architecture_config: DenoiserArchitectureConfig,
       rngs: nnx.Rngs,
+      gpu_mesh,
   ):
     self.rngs = rngs
     self.predictor = DenoiserArchitecture(
         denoiser_architecture_config=denoiser_architecture_config,
         rngs=self.rngs,
+        gpu_mesh=gpu_mesh
     )
     # Use default values if not specified.
     if noise_encoder_config is None:
@@ -176,9 +176,15 @@ class Denoiser(nnx.Module):
       noise_levels: xarray.DataArray,
       forcings: Optional[xarray.Dataset] = None,
       **kwargs) -> xarray.Dataset:
-    if forcings is None: forcings = xarray.Dataset()
-    forcings = forcings.assign(noisy_targets)
+    
 
+    if forcings is None: forcings = xarray.Dataset()
+    
+    ################################################
+    forcings = forcings.assign(noisy_targets)
+    ################################################
+
+    
     if noise_levels.dims != ("batch",):
       raise ValueError("noise_levels expected to be shape (batch,).")
     noise_level_encodings = self.noise_level_encoder(
@@ -229,6 +235,7 @@ class DenoiserArchitecture(nnx.Module):
       self,
       denoiser_architecture_config: DenoiserArchitectureConfig,
       rngs: nnx.Rngs,
+      gpu_mesh,
   ):
     """Initializes the predictor."""
     self._spatial_features_kwargs = dict(
@@ -248,70 +255,18 @@ class DenoiserArchitecture(nnx.Module):
     # operations.
     self._mesh = _permute_mesh_to_banded(mesh=mesh)
 
-    # Encoder, which moves data from the grid to the mesh with a single message
-    # passing step.
-    self.grid2mesh_gnn = (
-        deep_typed_graph_net.DeepTypedGraphNet(
-            activation="swish",
-            aggregate_normalization=(
-                denoiser_architecture_config.grid2mesh_aggregate_normalization
-            ),
-            edge_latent_size=dict(
-                grid2mesh=denoiser_architecture_config.latent_size
-            ),
-            embed_edges=True,
-            embed_nodes=True,
-            f32_aggregation=True,
-            include_sent_messages_in_node_update=False,
-            mlp_hidden_size=denoiser_architecture_config.latent_size,
-            mlp_num_hidden_layers=denoiser_architecture_config.hidden_layers,
-            node_latent_size=dict(
-                grid_nodes=denoiser_architecture_config.latent_size,
-                mesh_nodes=denoiser_architecture_config.latent_size
-            ),
-            node_output_size=None,
-            num_message_passing_steps=1,
-            use_layer_norm=True,
-            use_norm_conditioning=True,
-            rngs=self.rngs,
-        )
-    )
+    # Defer layer initialization until we have graph templates (built in _maybe_init).
+    # Store frequently used config and handles.
+    self._denoiser_architecture_config = denoiser_architecture_config
+    self._gpu_mesh = gpu_mesh
+    self.grid2mesh_gnn = None
 
     # Processor - performs multiple rounds of message passing on the mesh.
-    self.mesh_gnn = transformer.MeshTransformer(
-        transformer_ctor=sparse_transformer.Transformer,
-        transformer_kwargs=dataclasses.asdict(
-            denoiser_architecture_config.sparse_transformer_config
-        ),
-        rngs=self.rngs,
-    )
+    self.mesh_gnn = None
 
     # Decoder, which moves data from the mesh back into the grid with a single
     # message passing step.
-    self.mesh2grid_gnn = (
-        deep_typed_graph_net.DeepTypedGraphNet(
-            activation="swish",
-            edge_latent_size=dict(
-                mesh2grid=denoiser_architecture_config.latent_size
-            ),
-            embed_nodes=False,
-            f32_aggregation=False,
-            include_sent_messages_in_node_update=False,
-            mlp_hidden_size=denoiser_architecture_config.latent_size,
-            mlp_num_hidden_layers=denoiser_architecture_config.hidden_layers,
-            node_latent_size=dict(
-                grid_nodes=denoiser_architecture_config.latent_size,
-                mesh_nodes=denoiser_architecture_config.latent_size,
-            ),
-            node_output_size=dict(
-                grid_nodes=denoiser_architecture_config.node_output_size
-            ),
-            num_message_passing_steps=1,
-            use_layer_norm=True,
-            use_norm_conditioning=True,
-            rngs=self.rngs,
-        )
-    )
+    self.mesh2grid_gnn = None
 
     self._norm_conditioning_features = (
         denoiser_architecture_config.norm_conditioning_features
@@ -350,7 +305,9 @@ class DenoiserArchitecture(nnx.Module):
                targets_template: xarray.Dataset,
                forcings: xarray.Dataset,
                ) -> xarray.Dataset:
-    self._maybe_init(inputs)
+    # Initialize graph structures and networks with correct input feature sizes
+    # based on the actual inputs/forcings present in this call.
+    self._maybe_init(inputs, forcings)
 
     # Convert all input data into flat vectors for each of the grid nodes.
     # xarray (batch, time, lat, lon, level, multiple vars, forcings)
@@ -371,13 +328,11 @@ class DenoiserArchitecture(nnx.Module):
     updated_latent_mesh_nodes = self._run_mesh_gnn(
         latent_mesh_nodes, global_norm_conditioning
     )
-
     # Transfer data from the mesh to the grid.
     # [num_grid_nodes, batch, output_size]
     output_grid_nodes = self._run_mesh2grid_gnn(
         updated_latent_mesh_nodes, latent_grid_nodes, global_norm_conditioning
     )
-
     # Convert output flat vectors for the grid nodes to the format of the
     # output. [num_grid_nodes, batch, output_size] -> xarray (batch, one time
     # step, lat, lon, level, multiple vars)
@@ -385,17 +340,81 @@ class DenoiserArchitecture(nnx.Module):
         output_grid_nodes, targets_template
     )
 
-  def _maybe_init(self, sample_inputs: xarray.Dataset):
-    """Inits everything that has a dependency on the input coordinates."""
+  def _maybe_init(self, sample_inputs: xarray.Dataset, sample_forcings: xarray.Dataset):
     if not self._initialized:
-      self._init_mesh_properties()
-      self._init_grid_properties(
-          grid_lat=sample_inputs.lat, grid_lon=sample_inputs.lon)
-      self._grid2mesh_graph_structure = self._init_grid2mesh_graph()
-      self._mesh_graph_structure = self._init_mesh_graph()
-      self._mesh2grid_graph_structure = self._init_mesh2grid_graph()
+        self._init_mesh_properties()
+        self._init_grid_properties(grid_lat=sample_inputs.lat, grid_lon=sample_inputs.lon)
 
-      self._initialized = True
+        # Compute data channel width seen by grid nodes to size the encoder correctly.
+        sample_grid_feats, _ = self._inputs_to_grid_node_features_and_norm_conditioning(
+            sample_inputs, sample_forcings
+        )
+        self._data_feature_size = int(sample_grid_feats.shape[-1])
+
+        # Build graph templates. For grid2mesh, include dummy data channels so the
+        # embedder input size = (struct + data) is fixed at init.
+        self._grid2mesh_graph_structure = self._init_grid2mesh_graph(
+            extra_node_features_size=self._data_feature_size
+        )
+        self._mesh_graph_structure = self._init_mesh_graph()
+        self._mesh2grid_graph_structure = self._init_mesh2grid_graph()
+
+        # Now it’s safe to create networks (NNX eager init needs known input sizes).
+        cfg = self._denoiser_architecture_config
+
+        self.grid2mesh_gnn = deep_typed_graph_net.DeepTypedGraphNet(
+            activation="swish",
+            aggregate_normalization=(cfg.grid2mesh_aggregate_normalization),
+            edge_latent_size=dict(grid2mesh=cfg.latent_size),
+            embed_edges=True,
+            embed_nodes=True,
+            f32_aggregation=True,
+            include_sent_messages_in_node_update=False,
+            mlp_hidden_size=cfg.latent_size,
+            mlp_num_hidden_layers=cfg.hidden_layers,
+            node_latent_size=dict(
+                grid_nodes=cfg.latent_size,
+                mesh_nodes=cfg.latent_size,
+            ),
+            node_output_size=None,
+            num_message_passing_steps=1,
+            use_layer_norm=True,
+            use_norm_conditioning=True,
+            rngs=self.rngs,
+            gpu_mesh=self._gpu_mesh,
+            graph_template=self._grid2mesh_graph_structure,
+        )
+
+        self.mesh_gnn = transformer.MeshTransformer(
+            transformer_kwargs=dataclasses.asdict(cfg.sparse_transformer_config),
+            rngs=self.rngs,
+            gpu_mesh=self._gpu_mesh,
+            graph_template=self._mesh_graph_structure,
+        )
+
+        self.mesh2grid_gnn = deep_typed_graph_net.DeepTypedGraphNet(
+            activation="swish",
+            edge_latent_size=dict(mesh2grid=cfg.latent_size),
+            embed_nodes=False,
+            f32_aggregation=False,
+            include_sent_messages_in_node_update=False,
+            mlp_hidden_size=cfg.latent_size,
+            mlp_num_hidden_layers=cfg.hidden_layers,
+            node_latent_size=dict(
+                grid_nodes=cfg.latent_size,
+                mesh_nodes=cfg.latent_size,
+            ),
+            node_output_size=dict(grid_nodes=cfg.node_output_size),
+            num_message_passing_steps=1,
+            use_layer_norm=True,
+            use_norm_conditioning=True,
+            rngs=self.rngs,
+            gpu_mesh=self._gpu_mesh,
+            graph_template=self._mesh2grid_graph_structure,
+        )
+
+        self._initialized = True
+
 
   def _init_mesh_properties(self):
     """Inits static properties that have to do with mesh nodes."""
@@ -404,11 +423,7 @@ class DenoiserArchitecture(nnx.Module):
         self._mesh.vertices[:, 0],
         self._mesh.vertices[:, 1],
         self._mesh.vertices[:, 2])
-    (
-        mesh_nodes_lat,
-        mesh_nodes_lon,
-    ) = model_utils.spherical_to_lat_lon(
-        phi=mesh_phi, theta=mesh_theta)
+    mesh_nodes_lat, mesh_nodes_lon = model_utils.spherical_to_lat_lon(phi=mesh_phi, theta=mesh_theta)
     # Convert to f32 to ensure the lat/lon features aren't in f64.
     self._mesh_nodes_lat = mesh_nodes_lat.astype(np.float32)
     self._mesh_nodes_lon = mesh_nodes_lon.astype(np.float32)
@@ -425,7 +440,7 @@ class DenoiserArchitecture(nnx.Module):
     self._grid_nodes_lon = grid_nodes_lon.reshape([-1]).astype(np.float32)
     self._grid_nodes_lat = grid_nodes_lat.reshape([-1]).astype(np.float32)
 
-  def _init_grid2mesh_graph(self) -> typed_graph.TypedGraph:
+  def _init_grid2mesh_graph(self, *, extra_node_features_size: int = 0) -> typed_graph.TypedGraph:
     """Build Grid2Mesh graph."""
 
     # Create some edges according to distance between mesh and grid nodes.
@@ -458,6 +473,23 @@ class DenoiserArchitecture(nnx.Module):
     n_grid_node = np.array([self._num_grid_nodes])
     n_mesh_node = np.array([self._num_mesh_nodes])
     n_edge = np.array([mesh_indices.shape[0]])
+
+    # If requested, append dummy zeros to node structural features so that
+    # the embedder MLP is initialized with (struct + data) input width.
+    if extra_node_features_size > 0:
+      senders_node_features = np.concatenate(
+          [senders_node_features,
+           np.zeros((senders_node_features.shape[0], extra_node_features_size),
+                    dtype=senders_node_features.dtype)],
+          axis=-1,
+      )
+      receivers_node_features = np.concatenate(
+          [receivers_node_features,
+           np.zeros((receivers_node_features.shape[0], extra_node_features_size),
+                    dtype=receivers_node_features.dtype)],
+          axis=-1,
+      )
+
     grid_node_set = typed_graph.NodeSet(
         n_node=n_grid_node, features=senders_node_features)
     mesh_node_set = typed_graph.NodeSet(
@@ -568,61 +600,93 @@ class DenoiserArchitecture(nnx.Module):
     return mesh2grid_graph
 
   def _run_grid2mesh_gnn(self, grid_node_features: chex.Array,
-                         global_norm_conditioning: Optional[chex.Array] = None,
-                         ) -> tuple[chex.Array, chex.Array]:
-    """Runs the grid2mesh_gnn, extracting latent mesh and grid nodes."""
+                        global_norm_conditioning: Optional[chex.Array] = None
+                        ) -> tuple[chex.Array, chex.Array]:
 
-    # Concatenate node structural features with input features.
     batch_size = grid_node_features.shape[1]
+
+
+    #################################################################################
+    # C_data = int(self._data_feature_size)
+    # assert C_data == int(grid_node_features.shape[-1]), "Runtime data width changed."
+
+
+    ###################################################################################
+    C_data = grid_node_features.shape[-1]
+    if self._data_feature_size is None:
+        print(">>> [DEBUG] Setting _data_feature_size =", C_data)
+        self._data_feature_size = C_data
+    else:
+        if C_data != self._data_feature_size:
+            print(">>> [ERROR] Runtime data width changed!")
+            print(">>> [ERROR] Expected:", self._data_feature_size)
+            print(">>> [ERROR] Got:", C_data)
+
+            # Also show variable-by-variable count
+            print(">>> [ERROR] Variables included in grid_node_features:")
+            if hasattr(self, "_last_variable_list"):
+                print("    ", self._last_variable_list)
+
+            raise AssertionError(
+                f"Runtime data width changed: expected {self._data_feature_size}, got {C_data}"
+            )
+
 
     grid2mesh_graph = self._grid2mesh_graph_structure
     assert grid2mesh_graph is not None
-    grid_nodes = grid2mesh_graph.nodes["grid_nodes"]
-    mesh_nodes = grid2mesh_graph.nodes["mesh_nodes"]
-    new_grid_nodes = grid_nodes._replace(
+
+    grid_nodes_tpl = grid2mesh_graph.nodes["grid_nodes"]
+    mesh_nodes_tpl = grid2mesh_graph.nodes["mesh_nodes"]
+
+    # Template features are [STRUCT | DUMMY_DATA]
+    grid_tpl = jnp.asarray(grid_nodes_tpl.features)
+    mesh_tpl = jnp.asarray(mesh_nodes_tpl.features)
+    Cg = int(grid_tpl.shape[-1]); Cm = int(mesh_tpl.shape[-1])
+    Cg_struct = Cg - C_data
+    Cm_struct = Cm - C_data
+    if Cg_struct < 0 or Cm_struct < 0:
+        raise ValueError("Template for grid2mesh must contain reserved dummy data channels.")
+
+    # Build runtime features that EXACTLY match the template width = struct + data
+    grid_struct = grid_tpl[:, :Cg_struct]
+    mesh_struct = mesh_tpl[:, :Cm_struct]
+
+    new_grid_nodes = grid_nodes_tpl._replace(
         features=jnp.concatenate([
-            grid_node_features,
-            _add_batch_second_axis(
-                grid_nodes.features.astype(grid_node_features.dtype),
-                batch_size)
-        ],
-                                 axis=-1))
+            _add_batch_second_axis(grid_struct.astype(grid_node_features.dtype), batch_size),
+            grid_node_features
+        ], axis=-1)
+    )
 
-    # To make sure capacity of the embedded is identical for the grid nodes and
-    # the mesh nodes, we also append some dummy zero input features for the
-    # mesh nodes.
-    dummy_mesh_node_features = jnp.zeros(
-        (self._num_mesh_nodes,) + grid_node_features.shape[1:],
-        dtype=grid_node_features.dtype)
-    new_mesh_nodes = mesh_nodes._replace(
+    # Mesh nodes carry zeros for the data block (same width)
+    dummy_mesh_data = jnp.zeros((self._num_mesh_nodes, batch_size, C_data), dtype=grid_node_features.dtype)
+    new_mesh_nodes = mesh_nodes_tpl._replace(
         features=jnp.concatenate([
-            dummy_mesh_node_features,
-            _add_batch_second_axis(
-                mesh_nodes.features.astype(dummy_mesh_node_features.dtype),
-                batch_size)
-        ],
-                                 axis=-1))
+            _add_batch_second_axis(mesh_struct.astype(grid_node_features.dtype), batch_size),
+            dummy_mesh_data
+        ], axis=-1)
+    )
 
-    # Broadcast edge structural features to the required batch size.
-    grid2mesh_edges_key = grid2mesh_graph.edge_key_by_name("grid2mesh")
-    edges = grid2mesh_graph.edges[grid2mesh_edges_key]
+    # Broadcast edge features to batch
+    grid2mesh_key = grid2mesh_graph.edge_key_by_name("grid2mesh")
+    edges_tpl = grid2mesh_graph.edges[grid2mesh_key]
+    new_edges = edges_tpl._replace(
+        features=_add_batch_second_axis(edges_tpl.features.astype(grid_node_features.dtype), batch_size)
+    )
 
-    new_edges = edges._replace(
-        features=_add_batch_second_axis(
-            edges.features.astype(dummy_mesh_node_features.dtype), batch_size))
-
+    # Assemble input graph
     input_graph = self._grid2mesh_graph_structure._replace(
-        edges={grid2mesh_edges_key: new_edges},
-        nodes={
-            "grid_nodes": new_grid_nodes,
-            "mesh_nodes": new_mesh_nodes
-        })
+        edges={grid2mesh_key: new_edges},
+        nodes={"grid_nodes": new_grid_nodes, "mesh_nodes": new_mesh_nodes}
+    )
 
-    # Run the GNN.
-    grid2mesh_out = self.grid2mesh_gnn(input_graph, global_norm_conditioning)
-    latent_mesh_nodes = grid2mesh_out.nodes["mesh_nodes"].features
-    latent_grid_nodes = grid2mesh_out.nodes["grid_nodes"].features
-    return latent_mesh_nodes, latent_grid_nodes
+    # Sanity: width must match template (avoids dot_general shape errors)
+    assert new_grid_nodes.features.shape[-1] == grid_tpl.shape[-1]
+    assert new_mesh_nodes.features.shape[-1] == mesh_tpl.shape[-1]
+
+    out = self.grid2mesh_gnn(input_graph, global_norm_conditioning)
+    return out.nodes["mesh_nodes"].features, out.nodes["grid_nodes"].features
+
 
   def _run_mesh_gnn(self, latent_mesh_nodes: chex.Array,
                     global_norm_conditioning: Optional[chex.Array] = None

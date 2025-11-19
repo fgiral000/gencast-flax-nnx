@@ -1,8 +1,102 @@
 # Google DeepMind GenCast -- Flax NNX reimplementation
 
-This is a reimplementation of **DeepMind's Gencast model** using the new [Flax](https://github.com/google/flax) API: NNX, instead of the Haiku library.
+This repository provides a Flax **NNX** reimplementation of DeepMind's **GenCast** diffusion-based medium‑range weather forecasting model. The original research code bases rely on Haiku; here we explore a pure Flax / NNX approach with an emphasis on clarity, modularity, and educational value.
 
-NOTE: Work in progress...
+> Status: Only the GenCast side has been ported. The GraphCast model files are largely untouched and not yet runnable under NNX.
+
+
+We trained a small "nano" version of GenCast to validate the NNX port and end‑to‑end data/training/inference pipeline. The goal was not to reach a functional model, but to:
+* Establish a working NNX-based architecture (denoiser + sampler + rollout).
+* Provide a lightweight sandbox for experimentation and future scaling.
+* Serve as educational material for diffusion-based ensemble forecasting in JAX.
+
+## Dataset Subset & Constraints
+For computational reasons we used a **highly reduced ERA5 subset**:
+* Spatial resolution: 2.5° grid.
+* Temporal scope: A limited selection of 10 years (summer months only) to reduce volume.
+* Variables: Core surface + a small set of pressure level fields (see `era5_dataset.py`).
+
+These constraints lower training cost; performance metrics should NOT be compared with published GenCast benchmarks. This codebase is a *functional scaffold* for future larger-scale training.
+
+## Training Configuration (Nano-GenCast)
+Key parameters of the demonstration run:
+* Steps: ~30k
+* Batch size: 1 (memory & GPU constraints)
+* Diffusion sampler: DPM-Solver++ 2S (see `dpm_solver_plus_plus_2s.py`)
+* Model: Minimized channel counts & depth vs. original GenCast
+
+Potential improvements (next steps): increase batch size, extend temporal coverage, move to finer grid (1°), and incorporate operational HRES fine-tuning.
+
+## Inference Demo
+Below is a 30‑step (teacher-forcing) rollout from the nano model (single ensemble member) using the reduced ERA5 initial conditions:
+
+![30-step rollout animation](inference_plots_30steps/rollout.gif)
+
+The corresponding `rollout_30steps.nc` file (in `inference_plots_30steps/`) contains the forecast trajectory for inspection and post‑processing.
+
+
+Two example triptych panels (Initial / Predicted / Difference) from the same 30‑step sequence:
+
+| 2m Temperature | Mean Sea Level Pressure |
+| --------------- | ----------------------- |
+| ![2m temperature triptych](inference_plots_30steps/triptych_2m_temperature.png) | ![MSLP triptych](inference_plots_30steps/triptych_mean_sea_level_pressure.png) |
+
+Additional wind component plots are available in the same folder (`triptych_10m_u_component_of_wind.png`, `triptych_10m_v_component_of_wind.png`).
+
+## Repository Structure & Key Scripts
+
+### High-Level Directories
+* `common/`: Core graph, mesh, normalization, autoregressive and rollout utilities shared across models.
+* `gencast/`: GenCast-specific denoiser, samplers, and model wiring.
+* `training/`: Data loaders, helpers, training & evaluation loops for the nano model.
+* `scripts/`: Shell scripts to orchestrate downloads, training and evaluation on cluster or local.
+* `inference_plots_30steps/`: Artifacts from a sample inference run.
+
+
+### Python Modules (`training/`)
+| File | Role |
+|------|------|
+| `era5_dataset.py` | Dataset abstraction for loading / slicing ERA5 subset into JAX arrays/xarray. |
+| `download_era5_earthkit.py` | Programmatic ERA5 fetching via Earthkit APIs. |
+| `train.py` | Main training loop (model init, diffusion steps, checkpointing). |
+| `train_helpers.py` | Utility functions (loss assembly, schedule helpers, logging). |
+| `evaluation.py` | Rollout & sampler application, generating plots/NetCDF. |
+| `plotting_helpers.py` | Plot/triptych generation utilities. |
+| `check_era5_structure.py` | Validation that downloaded ERA5 matches expected schema. |
+
+## Getting Started
+
+### Installation
+
+```bash
+pip install -r requirements.txt
+```
+```bash
+python training/data_sample.py  # Verifies shapes & a tiny batch
+```
+
+### Download (Subset) ERA5 Data
+```bash
+bash scripts/data_download.sh
+```
+
+### Train Nano-GenCast
+```bash
+bash scripts/train.sh
+```
+Adjust hyperparameters in `train.sh` or directly in `training/train.py` (e.g., number of diffusion steps, learning rate, channels).
+
+### Evaluate / Generate Rollout
+```bash
+bash scripts/evaluation.sh
+```
+Artifacts appear under `inference_plots_30steps/` (GIF, triptychs, NetCDF).
+
+---
+
+# Upstream DeepMind Reference (Original README Content)
+Below is the original DeepMind README content for context and citation. Portions may refer to Haiku implementations; adapt semantics when using the NNX port above.
+
 
 
 # Google DeepMind Graphcast and Gencast

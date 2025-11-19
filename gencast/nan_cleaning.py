@@ -25,7 +25,7 @@ import xarray
 import flax.nnx as nnx
 
 
-class NaNCleaner(nnx.Module, base.Predictor):
+class NaNCleaner(nnx.Module):
   """A predictor wrapper than removes NaNs from ingested data.
 
   The Predictor which is wrapped sees inputs and targets without NaNs.
@@ -39,7 +39,7 @@ class NaNCleaner(nnx.Module, base.Predictor):
       reintroduce_nans: bool = False,
   ):
     """Initializes the NaNCleaner."""
-    self._predictor = predictor
+    self.predictor = predictor
     self._fill_value = fill_value[var_to_clean]
     self._var_to_clean = var_to_clean
     self._reintroduce_nans = reintroduce_nans
@@ -77,7 +77,7 @@ class NaNCleaner(nnx.Module, base.Predictor):
       inputs = self._clean(inputs)
     if forcings and self._var_to_clean in forcings.keys():
       forcings = self._clean(forcings)
-    predictions = self._predictor(
+    predictions = self.predictor(
         inputs, targets_template, forcings, **kwargs
     )
     if self._reintroduce_nans:
@@ -97,7 +97,7 @@ class NaNCleaner(nnx.Module, base.Predictor):
       targets = self._clean(targets)
     if forcings and self._var_to_clean in forcings.keys():
       forcings = self._clean(forcings)
-    return self._predictor.loss(
+    return self.predictor.loss(
         inputs, targets, forcings, **kwargs
     )
 
@@ -118,9 +118,40 @@ class NaNCleaner(nnx.Module, base.Predictor):
     if forcings and self._var_to_clean in forcings.keys():
       forcings = self._clean(forcings)
 
-    loss, predictions = self._predictor.loss_and_predictions(
+    loss, predictions = self.predictor.loss_and_predictions(
         inputs, targets, forcings, **kwargs
     )
     if self._reintroduce_nans:
       predictions = self._maybe_reintroduce_nans(original_inputs, predictions)
     return loss, predictions
+
+
+  def full_sampling(
+      self,
+      inputs: xarray.Dataset,
+      targets_template: xarray.Dataset,
+      forcings: Optional[xarray.Dataset] = None,
+      **kwargs,
+  ) -> xarray.Dataset:
+    """Run full diffusion sampling with NaN cleaning."""
+    if self._reintroduce_nans:
+      original_inputs = inputs.copy()
+
+    # Clean NaNs on inputs / forcings just like in __call__ / loss.
+    if self._var_to_clean in inputs.keys():
+      inputs = self._clean(inputs)
+    if forcings is not None and self._var_to_clean in forcings.keys():
+      forcings = self._clean(forcings)
+
+    preds = self.predictor.full_sampling(
+        inputs=inputs,
+        targets_template=targets_template,
+        forcings=forcings,
+        **kwargs,
+    )
+
+    if self._reintroduce_nans:
+      preds = self._maybe_reintroduce_nans(original_inputs, preds)
+
+    return preds
+
