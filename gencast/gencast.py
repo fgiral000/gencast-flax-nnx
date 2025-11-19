@@ -50,7 +50,7 @@ TARGET_SURFACE_NO_PRECIP_VARS = (
     'mean_sea_level_pressure',
     '10m_v_component_of_wind',
     '10m_u_component_of_wind',
-    'sea_surface_temperature',
+    # 'sea_surface_temperature',
 )
 
 
@@ -62,7 +62,7 @@ TASK = graphcast.TaskConfig(
         + graphcast.GENERATED_FORCING_VARS
         + graphcast.STATIC_VARS
     ),
-    target_variables=TARGET_SURFACE_VARS + graphcast.TARGET_ATMOSPHERIC_VARS,
+    target_variables=TARGET_SURFACE_NO_PRECIP_VARS + graphcast.TARGET_ATMOSPHERIC_VARS,
     # GenCast doesn't take incident solar radiation as a forcing.
     forcing_variables=graphcast.GENERATED_FORCING_VARS,
     pressure_levels=graphcast.PRESSURE_LEVELS_WEATHERBENCH_13,
@@ -149,7 +149,9 @@ class GenCast(nnx.Module):
       sampler_config: Optional[SamplerConfig] = None,
       noise_config: Optional[NoiseConfig] = None,
       noise_encoder_config: Optional[denoiser.NoiseEncoderConfig] = None,
+      gpu_mesh = None,
       rngs: nnx.Rngs = nnx.Rngs(0),
+      
   ):
     """Constructs GenCast."""
     # Output size depends on number of variables being predicted.
@@ -172,13 +174,13 @@ class GenCast(nnx.Module):
         noise_encoder_config,
         denoiser_architecture_config,
         rngs=self.rngs,
+        gpu_mesh=gpu_mesh
     )
     self._sampler_config = sampler_config
     self._noise_config = noise_config
     # Singleton to avoid re-initializing the sampler for each inference call.
     self._sampler = dpm_solver_plus_plus_2s.Sampler(
           self.denoiser,
-          rngs=self.rngs,
           **self._sampler_config,
       )
     
@@ -270,8 +272,8 @@ class GenCast(nnx.Module):
             '10m_u_component_of_wind': 0.1,
             '10m_v_component_of_wind': 0.1,
             'mean_sea_level_pressure': 0.1,
-            'sea_surface_temperature': 0.1,
-            'total_precipitation_12hr': 0.1
+            # 'sea_surface_temperature': 0.1,
+            # 'total_precipitation_12hr': 0.1
         },
     )
     loss *= self._loss_weighting(noise_levels)
@@ -289,4 +291,4 @@ class GenCast(nnx.Module):
                     targets_template: xarray.Dataset,
                     forcings: Optional[xarray.Dataset] = None,
                     **kwargs) -> xarray.Dataset:
-    return self._sampler(inputs, targets_template, forcings, **kwargs)
+    return self._sampler(inputs, targets_template, forcings, rngs=self.rngs, **kwargs)

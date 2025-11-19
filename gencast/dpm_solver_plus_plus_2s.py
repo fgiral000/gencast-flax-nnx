@@ -66,6 +66,18 @@ class Sampler(sampler_base.Sampler):
         sigmas = jnp.array(self._noise_levels, dtype=dtype)
         churns = jnp.array(self._per_step_churn_rates, dtype=dtype)
 
+        # --- Precompute initial spherical noise on the sphere ---
+        # Use the xarray-based spherical noise on the targets_template grid.
+        spherical_noise_ds = utils.spherical_white_noise_like(
+            targets_template, rngs=rngs
+        )
+        spherical_noise_da = spherical_noise_ds.to_array()
+        spherical_noise_arr = xarray_jax.unwrap_data(spherical_noise_da)
+
+        # Scale by the maximum noise level σ_0 to get the initial x_σ0
+        init_x = spherical_noise_arr * sigmas[0]
+
+
         # 3) denoiser wrapper on raw arrays
         def denoise_arr(sigma: jnp.ndarray, x_arr: jnp.ndarray) -> jnp.ndarray:
             # Handle the edge case where sigma=0 which causes NaNs in the denoiser
@@ -75,6 +87,13 @@ class Sampler(sampler_base.Sampler):
             # rebuild a tiny Dataset for the denoiser
             da = xarray_jax.DataArray(x_arr, dims=dims, coords=coords)
             ds = da.to_dataset(dim="variable")
+
+            for v, tmpl_var in targets_template.data_vars.items():
+                # Unconditionally squeeze artificial broadcast 'level' for single-level template vars.
+                # The earlier safety check caused TracerBoolConversion warnings inside the JAX loop.
+                if v in ds.data_vars and ('level' not in tmpl_var.dims) and ('level' in ds[v].dims):
+                    ds[v] = ds[v].isel(level=0).drop("level")
+
             # Build noise_levels as a (batch,) DataArray
             batch_coord = coords["batch"]
             batch_size  = batch_coord.size
@@ -100,29 +119,14 @@ class Sampler(sampler_base.Sampler):
 
         def body_fn(i: jnp.ndarray,
                     state: Tuple[jnp.ndarray, jnp.ndarray]
-                ) -> Tuple[jnp.ndarray, jnp.ndarray]:
-            """
-            One iteration of the 2S sampler, mirroring the DeepMind implementation
-            but on raw JAX arrays plus RNG key.
-            """
+                    ) -> Tuple[jnp.ndarray, jnp.ndarray]:
             x_arr, key = state
-            # ——————————————————————————————————————————————————————————————
-            # 1) Initial noise injection at i == 0
-            # ——————————————————————————————————————————————————————————————
-            # sample i.i.d. normal noise
-            init_noise, key = utils.spherical_white_noise_like(x_arr, key)
-            # only apply on the very first step
-            is_first = (i == 0).astype(dtype)
-            x_arr = x_arr + init_noise * sigmas[0] * is_first
 
-            # ——————————————————————————————————————————————————————————————
             # 2) Current noise level
-            # ——————————————————————————————————————————————————————————————
             sigma = sigmas[i]
 
-            # ——————————————————————————————————————————————————————————————
-            # 3) Stochastic churn (if enabled)
-            # ——————————————————————————————————————————————————————————————
+            # 3) (optional) stochastic churn – this part can stay,
+            #    as long as utils.apply_stochastic_churn_arr is pure JAX-array.
             if self._stochastic_churn:
                 x_arr, sigma, key = utils.apply_stochastic_churn_arr(
                     x_arr,
@@ -132,41 +136,43 @@ class Sampler(sampler_base.Sampler):
                     key
                 )
 
-            # ——————————————————————————————————————————————————————————————
-            # 4) ODE‐solver (2S) update
-            # ——————————————————————————————————————————————————————————————
-            # compute next and midpoint noise levels
+            # 4) Denoiser steps (2S update) – unchanged
             sigma_next = sigmas[i + 1]
             sigma_mid  = jnp.sqrt(sigma * sigma_next)
 
-            # first denoise at σᵢ
             x_denoised = denoise_arr(sigma, x_arr)
 
-            # midpoint update: x_mid = (σ_mid/σ) * x + (1 − σ_mid/σ) * x_denoised
             alpha_mid = sigma_mid / sigma
             x_mid = alpha_mid * x_arr + (1 - alpha_mid) * x_denoised
 
-            # second denoise at σ_mid
             x_mid_denoised = denoise_arr(sigma_mid, x_mid)
 
-            # full step update: x_next = (σₙₑₓₜ/σ) * x + (1 − σₙₑₓₜ/σ) * x_mid_denoised
             alpha_next = sigma_next / sigma
             x_next = alpha_next * x_arr + (1 - alpha_next) * x_mid_denoised
 
-            # ——————————————————————————————————————————————————————————————
-            # 5) Final‐step correction (avoid a second denoiser call at σ=0)
-            # ——————————————————————————————————————————————————————————————
             x_out = jnp.where(sigma_next == 0, x_denoised, x_next)
-
             return x_out, key
 
-
-        init = (jnp.zeros_like(arr_tmpl), key)
+        # Start the loop from spherical noise at σ_0 instead of zeros
+        init = (init_x, key)
         final_arr, _ = jax.lax.fori_loop(0, len(sigmas) - 1, body_fn, init)
-
         # 5) wrap back to Dataset using proper xarray_jax functions
         da_final = xarray_jax.DataArray(final_arr, dims=dims, coords=coords)
         result_ds = da_final.to_dataset(dim="variable")
+
+        # Apply the same single-level restoration on the final output.
+        for v, tmpl_var in targets_template.data_vars.items():
+            if v in result_ds.data_vars and ('level' not in tmpl_var.dims) and ('level' in result_ds[v].dims):
+                result_ds[v] = result_ds[v].isel(level=0).drop("level")
+
+        # Report restored width (count levels only for multi-level vars).
+        expected_width = 0
+        for v, tmpl_var in targets_template.data_vars.items():
+            expected_width += tmpl_var.sizes.get('level', 1)
+        actual_width = 0
+        for v, out_var in result_ds.data_vars.items():
+            actual_width += out_var.sizes.get('level', 1)
+        # print(f"[INFO] Restored runtime data width: {actual_width} (expected {expected_width})")
         
         return result_ds
     

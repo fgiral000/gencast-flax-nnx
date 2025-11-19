@@ -54,7 +54,7 @@ class MeshTransformer(nnx.Module):
                transformer_kwargs: Kwargs,
                *, # rngs must be a keyword argument
                rngs: nnx.Rngs,
-               mesh = None,
+               gpu_mesh = None,
                graph_template: Optional[typed_graph.TypedGraph] = None,
                precomputed_adj_mat: Optional[Any] = None,
                ):
@@ -72,7 +72,7 @@ class MeshTransformer(nnx.Module):
       name: Optional name for nnx module.
     """
     self._transformer_kwargs = transformer_kwargs
-    self._mesh = mesh
+    self.gpu_mesh = gpu_mesh
     
     if precomputed_adj_mat is not None:
       self.adj_mat = precomputed_adj_mat
@@ -87,7 +87,7 @@ class MeshTransformer(nnx.Module):
     self.batch_first_transformer = sparse_transformer.Transformer(
         adj_mat=self.adj_mat,
         rngs=rngs,
-        mesh=self._mesh,
+        mesh=self.gpu_mesh,
         **self._transformer_kwargs,
     )
 

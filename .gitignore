@@ -1,1 +1,7 @@
 */__pycache__/
+__pycache__/
+*.out
+checkpoints/
+data_era5/
+normalization_stats/
+wandb/

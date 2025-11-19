@@ -1,10 +1,9 @@
 #!/bin/bash
-#SBATCH --job-name=train
-#SBATCH --partition=standard-gpu
-#SBATCH --gres=gpu:a100:1
+#SBATCH --job-name=download_data
+#SBATCH --partition=standard
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=4
-#SBATCH --mem=32G
+#SBATCH --mem=64G
 #SBATCH --time=72:00:00
 #SBATCH --mail-type=ALL
 #SBATCH --mail-user=fa.giral@alumnos.upm.es
@@ -35,17 +34,11 @@ PY
 
 # headless plotting + XLA memory
 export MPLBACKEND=Agg
-export XLA_PYTHON_CLIENT_PREALLOCATE=false
-export XLA_PYTHON_CLIENT_MEM_FRACTION=0.85
-
-nvidia-smi || true
 
 # run with the exact interpreter from the env
-srun -u "$(which python)" -m training.train \
- --num_steps 30000 \
- --eval_every 100 \
- --clean_sst_nans \
- --apply_normalization \
- --use_wandb \
- --model_name gencast_model \
- --do_sampling_eval
+srun -u "$(which python)" -m training.download_era5_earthkit \
+    --out-dir data_era5 \
+    --start-year 2002 \
+    --end-year 2003 \
+    --resolution 2.5 \
+    --season JJA \

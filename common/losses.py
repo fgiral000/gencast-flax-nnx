@@ -16,9 +16,11 @@
 from typing import Mapping
 
 from common import xarray_tree
+from common import xarray_jax
 import numpy as np
 from typing_extensions import Protocol
 import xarray
+import jax.numpy as jnp
 
 
 LossAndDiagnostics = tuple[xarray.DataArray, xarray.Dataset]
@@ -135,7 +137,7 @@ def normalized_latitude_weights(data: xarray.DataArray) -> xarray.DataArray:
   Args:
     data: `DataArray` with latitude coordinates.
   Returns:
-    Unit mean latitude weights.
+    Unit mean latitude weights as a JAX-backed DataArray aligned on 'lat'.
   """
   latitude = data.coords['lat']
 
@@ -144,7 +146,13 @@ def normalized_latitude_weights(data: xarray.DataArray) -> xarray.DataArray:
   else:
     weights = _weight_for_latitude_vector_without_poles(latitude)
 
-  return weights / weights.mean(skipna=False)
+  # Normalize (NumPy) then wrap as JAX-backed DataArray to be safe under JIT.
+  normed = weights / weights.mean(skipna=False)
+  return xarray_jax.DataArray(
+    data=jnp.asarray(normed.data),
+    dims=('lat',),
+    coords={'lat': latitude},
+  )
 
 
 def _weight_for_latitude_vector_without_poles(latitude):

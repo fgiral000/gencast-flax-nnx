@@ -293,21 +293,35 @@ def sample(
   coords.update({'total_wavenumber': grid.total_wavenumber_coords,
                  'longitude_wavenumber': grid.longitude_wavenumber_coords})
   coeffs = xarray_jax.DataArray(
-      data=jax.random.normal(key, shape), dims=dims, coords=coords)
+    data=jax.random.normal(key, shape), dims=dims, coords=coords)
   # Mask out coefficients which are out of range. This broadcasts to a
-  # triangular mask with shape (total_wavenumber, longitude_wavenumber):
-  mask = (
-      abs(coeffs.longitude_wavenumber) <= coeffs.total_wavenumber
-      ).astype(np.float32)
+  # triangular mask with shape (total_wavenumber, longitude_wavenumber).
+  # Note: longitude/total_wavenumber coordinates are NumPy-backed, so make the
+  # resulting mask JAX-backed before mixing with JAX coeffs.
+  mask_np = (
+    abs(coeffs.longitude_wavenumber) <= coeffs.total_wavenumber
+  ).astype(np.float32)
+  mask = xarray_jax.DataArray(
+    data=jnp.asarray(mask_np.data, dtype=jnp.float32),
+    dims=mask_np.dims,
+    coords=mask_np.coords,
+  )
   # For total_wavenumber t, there will be 2t+1 non-zero coefficients at
-  # different longitude_wavenumbers. We must normalize the coefficients so that
-  # summing their squares at each total_wavenumber, sums to the corresponding
-  # value in the power spectrum:
-  multiplier = mask * np.sqrt(power_spectrum / mask.sum(
-      'longitude_wavenumber', skipna=False))
-  # And a standard normalization factor used in this implementation of the
-  # spherical harmonic transform:
-  multiplier *= np.sqrt(4 * np.pi)
+  # different longitude_wavenumbers. Normalize so that summing their squares at
+  # each total_wavenumber yields the power spectrum entry.
+  # Sum over longitude to get normalization denominator per total_wavenumber.
+  denom = mask.sum('longitude_wavenumber', skipna=False)
+  power_spec_arr = xarray_jax.jax_data(power_spectrum)        # (total_wavenumber,)
+  denom_arr = xarray_jax.jax_data(denom)                      # (total_wavenumber,)
+  mask_arr = xarray_jax.jax_data(mask)                        # (total_wavenumber, longitude_wavenumber)
+  # Broadcast explicitly: add singleton longitude axis to per-wavenumber term.
+  per_wavenumber_factor = jnp.sqrt(power_spec_arr / denom_arr)[:, None] * jnp.sqrt(4.0 * jnp.pi)
+  multiplier_arr = mask_arr * per_wavenumber_factor
+  multiplier = xarray_jax.DataArray(
+    data=multiplier_arr,
+    dims=mask.dims,
+    coords=mask.coords,
+  )
   # Only finally multiply by coeffs to avoid too many broadcasting
   # multiplications:
   coeffs *= multiplier
@@ -323,9 +337,11 @@ def spherical_white_noise_like(template: xarray.Dataset, rngs: nnx.Rngs) -> xarr
       key = rngs.noise()  # Generate a new key from the 'noise' stream
       return sample(
           key=key,
-          power_spectrum=xarray_jax.DataArray(
-              data=np.array([1 / num_wavenumbers for _ in range(num_wavenumbers)]),
-              dims=['total_wavenumber']),
+      power_spectrum=xarray_jax.DataArray(
+        data=jnp.asarray(
+          jnp.full((num_wavenumbers,), 1.0 / max(1, num_wavenumbers), dtype=jnp.float32)
+        ),
+        dims=['total_wavenumber']),
           template=data_array)
   return template.map(spherical_white_noise_like_dataarray)
 

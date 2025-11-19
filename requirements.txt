@@ -9,6 +9,7 @@ xarray-tensorstore
 dm-tree
 cartopy
 chex
+rtree
 matplotlib
 numpy
 pandas
@@ -16,3 +17,10 @@ scipy
 dinosaur-dycore
 optax
 grain
+earthkit-data
+earthkit-plots
+cdsapi
+cfgrib
+eccodes
+orbax-checkpoint
+imageio
