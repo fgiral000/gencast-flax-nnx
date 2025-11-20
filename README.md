@@ -30,6 +30,8 @@ Potential improvements (next steps): increase batch size, extend temporal covera
 ## Inference Demo
 Below is a 30‑step (teacher-forcing) rollout from the nano model (single ensemble member) using the reduced ERA5 initial conditions:
 
+![3d_animation](inference_plots_30steps/3d_animation_rollout.gif)
+
 ![30-step rollout animation](inference_plots_30steps/rollout.gif)
 
 The corresponding `rollout_30steps.nc` file (in `inference_plots_30steps/`) contains the forecast trajectory for inspection and post‑processing.
